@@ -1,0 +1,205 @@
+//! The session with the managers: one stream at a time to one manager, any manager. Hello, then a heartbeat every
+//! interval the manager asks for, and commands handled as they come. A stream that breaks, or a manager silent for
+//! longer than `SILENT`, sends the worker to the next manager in its list straight away; only after every manager has
+//! failed in a row does it wait, from one second doubling to thirty, a quarter either way at random, so workers do not
+//! all come back at once.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, anyhow, bail};
+use rand::RngExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use freightdock_proto::v1::{self, FencingState, WorkerMessage, manager_message, worker_message, worker_session_client::WorkerSessionClient};
+
+use crate::exec::Executor;
+use crate::host::Probe;
+use crate::{Config, Files};
+
+/// A manager that has sent nothing (not even a heartbeat's ack) for this long is given up on.
+const SILENT: Duration = Duration::from_secs(10);
+const MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// When this worker last heard from any manager. Starts at the process start, so a worker that never reaches a manager
+/// counts from then. Self-fencing (G6) runs its timers from this, not from when a dial failed: a half-open connection can
+/// hide a dead link for many seconds before any dial is tried.
+pub struct Contact(std::sync::Mutex<Instant>);
+
+impl Default for Contact {
+    fn default() -> Self {
+        Contact(std::sync::Mutex::new(Instant::now()))
+    }
+}
+
+impl Contact {
+    pub fn heard(&self) {
+        *self.0.lock().expect("contact lock") = Instant::now();
+    }
+
+    pub fn silent_for(&self) -> Duration {
+        self.0.lock().expect("contact lock").elapsed()
+    }
+}
+
+pub struct Worker {
+    pub config: Config,
+    pub files: Files,
+    pub node_id: String,
+    pub hostname: String,
+    pub docker: Option<bollard::Docker>,
+    pub exec: Arc<Executor>,
+    pub probe: Probe,
+    pub contact: Contact,
+}
+
+/// The wait after `failed_rounds` rounds in which no manager would talk.
+pub fn backoff(failed_rounds: u32, jitter: f64) -> Duration {
+    let base = Duration::from_secs(1).saturating_mul(1 << failed_rounds.min(5)).min(MAX_WAIT);
+    base.mul_f64(jitter.clamp(0.75, 1.25))
+}
+
+impl Worker {
+    /// Runs until the process ends.
+    pub async fn run(&self) -> Result<()> {
+        let mut failed_rounds = 0u32;
+        loop {
+            let order = crate::dial_order(&self.config.managers, &self.files.known_managers());
+            if order.is_empty() {
+                bail!("no manager to dial: set FREIGHTDOCK_MANAGERS");
+            }
+            let mut talked = false;
+            for addr in order {
+                match self.session(&addr, &mut talked).await {
+                    Ok(()) => tracing::info!("{addr} ended the stream"),
+                    Err(e) => tracing::warn!("{addr}: {e:#}"),
+                }
+                if talked {
+                    break;
+                }
+            }
+            if talked {
+                failed_rounds = 0;
+                continue;
+            }
+            // Phase 7 turns this into the self-fencing countdown (stop managed workloads at N, storage at N+X, reboot
+            // at N+X+Y). Until then it is only said.
+            tracing::warn!("no manager heard from for {}s", self.contact.silent_for().as_secs());
+            let wait = backoff(failed_rounds, rand::rng().random_range(0.75..1.25));
+            failed_rounds = failed_rounds.saturating_add(1);
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn session(&self, addr: &str, talked: &mut bool) -> Result<()> {
+        let tls = crate::tls::mutual(&self.files)?;
+        let ch = crate::tls::channel(addr, tls).await?;
+        let (tx, rx) = mpsc::channel::<WorkerMessage>(256);
+        let docker_version = match &self.docker {
+            Some(d) => crate::docker::version(d).await,
+            None => None,
+        };
+        let running = match &self.docker {
+            Some(d) => crate::docker::running(d).await,
+            None => 0,
+        };
+        let hello = v1::Hello {
+            node_id: self.node_id.clone(),
+            hostname: self.hostname.clone(),
+            agent_version: env!("CARGO_PKG_VERSION").into(),
+            boot_id: crate::host::boot_id(),
+            fencing_state: FencingState::None as i32,
+            labels: self.config.labels.clone().into_iter().collect(),
+            resources: Some(self.probe.resources(running)),
+            capabilities: Some(crate::host::capabilities(docker_version)),
+            in_flight: self.exec.in_flight(),
+        };
+        tx.send(WorkerMessage { body: Some(worker_message::Body::Hello(hello)) }).await?;
+        let mut inbound = WorkerSessionClient::new(ch).open(ReceiverStream::new(rx)).await?.into_inner();
+
+        let welcome = match tokio::time::timeout(SILENT, inbound.message()).await {
+            Ok(Ok(Some(v1::ManagerMessage { body: Some(manager_message::Body::Welcome(w)) }))) => w,
+            Ok(Err(s)) => bail!("{}", s.message()),
+            Err(_) => bail!("no welcome within {}s", SILENT.as_secs()),
+            _ => bail!("the manager's first message was not a welcome"),
+        };
+        *talked = true;
+        self.contact.heard();
+        self.files.keep_managers(&welcome.managers);
+        let every = Duration::from_millis(welcome.heartbeat_interval_ms.clamp(500, 30_000) as u64);
+        tracing::info!(manager = %welcome.manager_id, cluster = %welcome.cluster_id, "connected to {addr}; heartbeat every {}ms", every.as_millis());
+        self.exec.attach(Some(tx.clone()));
+
+        let beats = {
+            let (tx, docker) = (tx.clone(), self.docker.clone());
+            let probe = Probe::default();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(every);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut seq = 0u64;
+                loop {
+                    tick.tick().await;
+                    seq += 1;
+                    let running = match &docker {
+                        Some(d) => crate::docker::running(d).await,
+                        None => 0,
+                    };
+                    let sent_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)) };
+                    if tx.send(WorkerMessage { body: Some(worker_message::Body::Heartbeat(hb)) }).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let end = loop {
+            let next = tokio::time::timeout(SILENT, inbound.message()).await;
+            if matches!(next, Ok(Ok(Some(_)))) {
+                self.contact.heard();
+            }
+            match next {
+                Ok(Ok(Some(m))) => match m.body {
+                    Some(manager_message::Body::Command(c)) => {
+                        tracing::info!(command = %c.command_id, "command received");
+                        self.exec.handle(c);
+                    }
+                    Some(manager_message::Body::HeartbeatAck(_)) => {}
+                    Some(manager_message::Body::Welcome(w)) => self.files.keep_managers(&w.managers),
+                    None => {}
+                },
+                Ok(Ok(None)) => break Ok(()),
+                Ok(Err(s)) => break Err(anyhow!("{}", s.message())),
+                Err(_) => break Err(anyhow!("the manager was silent for {}s", SILENT.as_secs())),
+            }
+        };
+        self.exec.attach(None);
+        beats.abort();
+        end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contact_counts_from_the_last_word() {
+        let c = Contact::default();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(c.silent_for() >= Duration::from_millis(30));
+        c.heard();
+        assert!(c.silent_for() < Duration::from_millis(30));
+    }
+
+    #[test]
+    fn the_wait_doubles_to_thirty_seconds() {
+        assert_eq!(backoff(0, 1.0), Duration::from_secs(1));
+        assert_eq!(backoff(1, 1.0), Duration::from_secs(2));
+        assert_eq!(backoff(4, 1.0), Duration::from_secs(16));
+        assert_eq!(backoff(5, 1.0), Duration::from_secs(30));
+        assert_eq!(backoff(50, 1.0), Duration::from_secs(30));
+        assert_eq!(backoff(0, 9.0), Duration::from_millis(1250), "the jitter is a quarter at most");
+    }
+}

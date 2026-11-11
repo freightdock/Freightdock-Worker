@@ -1,0 +1,42 @@
+[package]
+name = "freightdock-worker"
+description = "Freightdock's worker-agent: joins a cluster's managers and runs the workloads they place on this host."
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/freightdock/Worker"
+rust-version = "1.90"
+
+[dependencies]
+anyhow = "1"
+bollard = "0.19"
+freightdock-proto = { path = "../Freightdock-Contracts" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+rand = "0.10"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.6"
+sysinfo = { version = "0.37", default-features = false, features = ["system", "disk"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "sync", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# A real manager, in process, for the end-to-end test of enrolment, the session and commands.
+freightdock-manager = { path = "../Freightdock-Manager" }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+overflow-checks = true

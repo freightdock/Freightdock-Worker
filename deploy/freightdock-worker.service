@@ -1,0 +1,20 @@
+[Unit]
+Description=Freightdock worker-agent
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+# Settings in /etc/freightdock/worker.env, e.g.
+#   FREIGHTDOCK_MANAGERS=10.0.0.11:7450,10.0.0.12:7450
+#   FREIGHTDOCK_JOIN_TOKEN=FDCT1-...      (spent once at the first start; can be removed after)
+#   FREIGHTDOCK_LABELS=region=lab
+EnvironmentFile=-/etc/freightdock/worker.env
+Environment=FREIGHTDOCK_WORKER_DATA=/var/lib/freightdock-worker
+ExecStart=/usr/local/bin/freightdock-worker
+Restart=always
+RestartSec=2
+StateDirectory=freightdock-worker
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
