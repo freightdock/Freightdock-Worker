@@ -132,6 +132,28 @@ fn valid_workload(id: &str) -> Result<()> {
     Ok(())
 }
 
+async fn pull(d: &Docker, image: &str) -> Result<()> {
+    let (from_image, tag) = split_tag(image);
+    let mut pull = d.create_image(Some(q::CreateImageOptions { from_image: Some(from_image.to_string()), tag: Some(tag.to_string()), ..Default::default() }), None, None);
+    while let Some(step) = pull.next().await {
+        let step = step.with_context(|| format!("pulling {image}"))?;
+        if let Some(e) = step.error_detail.and_then(|e| e.message) {
+            return Err(anyhow!("pulling {image}: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// What a failed pull means: with the image on this node (built or loaded here, never pushed anywhere) it runs from
+/// that one, `Ok(true)`; without, the pull's error stands.
+fn after_pull(pulled: Result<()>, here: bool) -> Result<bool> {
+    match pulled {
+        Ok(()) => Ok(false),
+        Err(_) if here => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     valid_workload(&r.workload_id)?;
     r.volumes.iter().try_for_each(|v| valid_volume(v))?;
@@ -146,13 +168,10 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
         // Made for another spec: made again.
         d.remove_container(&f.id, Some(q::RemoveContainerOptions { force: true, ..Default::default() })).await.context("removing the container of the old spec")?;
     }
-    let (from_image, tag) = split_tag(&r.image);
-    let mut pull = d.create_image(Some(q::CreateImageOptions { from_image: Some(from_image.to_string()), tag: Some(tag.to_string()), ..Default::default() }), None, None);
-    while let Some(step) = pull.next().await {
-        let step = step.with_context(|| format!("pulling {}", r.image))?;
-        if let Some(e) = step.error_detail.and_then(|e| e.message) {
-            return Err(anyhow!("pulling {}: {e}", r.image));
-        }
+    let pulled = pull(d, &r.image).await;
+    let here = pulled.is_err() && d.inspect_image(&r.image).await.is_ok();
+    if after_pull(pulled, here)? {
+        tracing::warn!(image = %r.image, "could not pull it; running the image already on this node");
     }
     let mut labels = r.labels.clone();
     labels.insert(LABEL_MANAGED.into(), "true".into());
@@ -253,6 +272,13 @@ mod tests {
         assert!(valid_volume("../x:/y").is_err());
         assert!(valid_volume("a:/b:rx").is_err());
         assert!(valid_volume("/only").is_err());
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_pulled_runs_from_the_one_here_if_there_is_one() {
+        assert!(matches!(after_pull(Ok(()), false), Ok(false)));
+        assert!(matches!(after_pull(Err(anyhow!("no registry")), true), Ok(true)), "built or loaded here, never pushed");
+        assert_eq!(after_pull(Err(anyhow!("pulling x: denied")), false).unwrap_err().to_string(), "pulling x: denied");
     }
 
     #[test]

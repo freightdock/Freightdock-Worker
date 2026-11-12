@@ -13,7 +13,7 @@ use freightdock_worker::session::Worker;
 use freightdock_worker::{Config, Files, enrol};
 
 async fn manager(dir: &std::path::Path, port: u16) -> (Arc<Manager>, tokio::task::JoinHandle<()>) {
-    let config = MConfig { data_dir: dir.into(), bind: format!("127.0.0.1:{port}").parse().unwrap(), api_bind: None, advertise: vec![format!("127.0.0.1:{port}")], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: None, fencing: Default::default() };
+    let config = MConfig { data_dir: dir.into(), bind: format!("127.0.0.1:{port}").parse().unwrap(), api_bind: None, api_tls_bind: None, ui_bind: None, advertise: vec![format!("127.0.0.1:{port}")], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: None, fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     let l = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let h = tokio::spawn({
