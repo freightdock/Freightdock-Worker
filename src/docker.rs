@@ -279,11 +279,50 @@ pub async fn stop(d: &Docker, s: &v1::StopContainer) -> Result<Value> {
     Ok(json!({ "container_id": id }))
 }
 
-pub async fn remove(d: &Docker, r: &v1::RemoveContainer) -> Result<Value> {
+/// Removes the workload's container. Answers, besides, the stack and the overlay address it leaves on this node, if
+/// it was on its stack's network: the others of the stack here may still hold its MAC for that address.
+pub async fn remove(d: &Docker, r: &v1::RemoveContainer) -> Result<(Value, Option<(String, String)>)> {
     valid_workload(&r.workload_id)?;
-    let Some(Found { id, .. }) = find(d, &r.workload_id).await? else { return Ok(json!({ "container_id": null })) };
+    let Some(Found { id, .. }) = find(d, &r.workload_id).await? else { return Ok((json!({ "container_id": null }), None)) };
+    let left = d.inspect_container(&id, None::<q::InspectContainerOptions>).await.ok().and_then(|c| left_behind(&c));
     d.remove_container(&id, Some(q::RemoveContainerOptions { force: true, ..Default::default() })).await.context("removing the container")?;
-    Ok(json!({ "container_id": id }))
+    Ok((json!({ "container_id": id }), left))
+}
+
+/// The stack and the address on its network of a container, if it was on its stack's network.
+fn left_behind(c: &bollard::models::ContainerInspectResponse) -> Option<(String, String)> {
+    let stack = c.config.as_ref()?.labels.as_ref()?.get(crate::net::LABEL_STACK)?.clone();
+    let ip = c.network_settings.as_ref()?.networks.as_ref()?.get(&crate::net::network_name(&stack))?.ip_address.clone().filter(|ip| !ip.is_empty())?;
+    Some((stack, ip))
+}
+
+/// Removes the stack's network from this node when no container of the stack is left here, running or not (a
+/// stopped one starts on it again). Answers whether it was removed.
+pub async fn drop_network_if_unused(d: &Docker, stack: &str) -> Result<bool> {
+    let f = HashMap::from([("label".to_string(), vec![format!("{}={stack}", crate::net::LABEL_STACK), format!("{LABEL_MANAGED}=true")])]);
+    if !d.list_containers(Some(q::ListContainersOptions { all: true, filters: Some(f), ..Default::default() })).await?.is_empty() {
+        return Ok(false);
+    }
+    match d.remove_network(&crate::net::network_name(stack)).await {
+        Ok(()) => Ok(true),
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
+        Err(e) => Err(e).context("removing the stack's network"),
+    }
+}
+
+/// The processes of the stack's containers running here, whose network namespaces hold their neighbours.
+pub async fn stack_pids(d: &Docker, stack: &str) -> Vec<u32> {
+    let f = HashMap::from([("label".to_string(), vec![format!("{}={stack}", crate::net::LABEL_STACK), format!("{LABEL_MANAGED}=true")]), ("status".to_string(), vec!["running".to_string()])]);
+    let Ok(list) = d.list_containers(Some(q::ListContainersOptions { filters: Some(f), ..Default::default() })).await else { return vec![] };
+    let mut pids = vec![];
+    for c in list {
+        if let Ok(i) = d.inspect_container(&c.id.unwrap_or_default(), None::<q::InspectContainerOptions>).await
+            && let Some(pid) = i.state.and_then(|s| s.pid).filter(|p| *p > 0)
+        {
+            pids.push(pid as u32);
+        }
+    }
+    pids
 }
 
 #[cfg(test)]
@@ -345,6 +384,20 @@ mod tests {
         assert!(attach(&v1::RunContainer { hosts: vec!["bad host:1.2.3.4".into()], ..r.clone() }).is_err());
         assert!(attach(&v1::RunContainer { network_stack: "../x".into(), ..r.clone() }).is_err());
         assert!(attach(&v1::RunContainer { address: "10.240.3.1".into(), ..r }).is_err(), "never the gateway");
+    }
+
+    #[test]
+    fn a_container_on_its_stack_s_network_leaves_its_stack_and_address() {
+        use bollard::models::{ContainerConfig, ContainerInspectResponse, EndpointSettings, NetworkSettings};
+        let c = |labels: &[(&str, &str)], nets: &[(&str, &str)]| ContainerInspectResponse {
+            config: Some(ContainerConfig { labels: Some(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()), ..Default::default() }),
+            network_settings: Some(NetworkSettings { networks: Some(nets.iter().map(|(n, ip)| (n.to_string(), EndpointSettings { ip_address: Some(ip.to_string()), ..Default::default() })).collect()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(left_behind(&c(&[("io.freightdock.stack", "g9")], &[("fd-g9", "10.240.5.3")])), Some(("g9".to_string(), "10.240.5.3".to_string())));
+        assert_eq!(left_behind(&c(&[("io.freightdock.stack", "g9")], &[("bridge", "172.17.0.4")])), None, "off the overlay");
+        assert_eq!(left_behind(&c(&[], &[("fd-g9", "10.240.5.3")])), None, "no stack's");
+        assert_eq!(left_behind(&c(&[("io.freightdock.stack", "g9")], &[("fd-g9", "")])), None);
     }
 
     #[test]

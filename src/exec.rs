@@ -163,7 +163,22 @@ impl Executor {
                 ("running".into(), v)
             }
             Op::StopContainer(s) => ("stopped".into(), crate::docker::stop(docker()?, &s).await?),
-            Op::RemoveContainer(r) => ("removed".into(), crate::docker::remove(docker()?, &r).await?),
+            Op::RemoveContainer(r) => {
+                let d = docker()?;
+                let (v, left) = crate::docker::remove(d, &r).await?;
+                if let Some((stack, addr)) = left {
+                    if let Some(n) = self.net.get() {
+                        n.clone().forget(crate::docker::stack_pids(d, &stack).await, addr).await;
+                    }
+                    // The last of the stack here: its network goes too, so a node keeps only what it runs.
+                    match crate::docker::drop_network_if_unused(d, &stack).await {
+                        Ok(true) => tracing::info!(%stack, "removed the stack's network, no container of it is left here"),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(%stack, "{e:#}"),
+                    }
+                }
+                ("removed".into(), v)
+            }
         })
     }
 }
