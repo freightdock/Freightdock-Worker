@@ -95,6 +95,8 @@ impl Worker {
             agent_version: env!("CARGO_PKG_VERSION").into(),
             boot_id: crate::host::boot_id(),
             fencing_state: fencing_state(&self.fence) as i32,
+            // The overlay comes with G9.4.
+            network: None,
             labels: self.config.labels.clone().into_iter().collect(),
             resources: Some(self.probe.resources(running)),
             capabilities: Some(crate::host::capabilities(docker_version)),
@@ -140,7 +142,7 @@ impl Worker {
                         Some(d) => crate::docker::workloads(d).await,
                         None => None,
                     };
-                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, fencing_state: fencing_state(&fence) as i32 };
+                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, network: None, fencing_state: fencing_state(&fence) as i32 };
                     if tx.send(WorkerMessage { body: Some(worker_message::Body::Heartbeat(hb)) }).await.is_err() {
                         break;
                     }
@@ -160,6 +162,8 @@ impl Worker {
                         self.exec.handle(c);
                     }
                     Some(manager_message::Body::HeartbeatAck(_)) => {}
+                    // The node's network: applied from G9.4, ignored until then.
+                    Some(manager_message::Body::Network(_)) => {}
                     Some(manager_message::Body::Authorize(a)) => {
                         if let Some(f) = self.fence.fenced() {
                             tracing::warn!(by = %a.by, "authorized by the managers again (fenced since {}: {})", f.at_ms, f.reason);
