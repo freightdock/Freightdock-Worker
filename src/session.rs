@@ -153,7 +153,11 @@ impl Worker {
                         Some(d) => crate::docker::workloads(d).await,
                         None => None,
                     };
-                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, network: net.as_ref().map(|n| n.report()), fencing_state: fencing_state(&fence) as i32 };
+                    let traffic = match &net {
+                        Some(n) => n.clone().traffic().await,
+                        None => None,
+                    };
+                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, network: net.as_ref().map(|n| n.report()), fencing_state: fencing_state(&fence) as i32, traffic };
                     if tx.send(WorkerMessage { body: Some(worker_message::Body::Heartbeat(hb)) }).await.is_err() {
                         break;
                     }

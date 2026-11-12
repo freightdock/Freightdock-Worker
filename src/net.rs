@@ -68,6 +68,8 @@ pub struct Net {
     agent: Mutex<Agent<System>>,
     /// The version applied and why the last one could not be, if it could not.
     status: Mutex<(u64, String)>,
+    /// Why the traffic could not be read, said once (G9.8): a node without `conntrack` reports none.
+    traffic_failed: std::sync::atomic::AtomicBool,
 }
 
 impl Net {
@@ -75,7 +77,7 @@ impl Net {
     pub fn open(dir: &Path) -> Result<Arc<Self>> {
         let path = dir.join("wg.key");
         let key = Key::load_or_make(&path)?;
-        Ok(Arc::new(Net { public: key.public(), agent: Mutex::new(Agent::new(System, path)), status: Mutex::default() }))
+        Ok(Arc::new(Net { public: key.public(), agent: Mutex::new(Agent::new(System, path)), status: Mutex::default(), traffic_failed: Default::default() }))
     }
 
     pub fn report(&self) -> v1::NetworkReport {
@@ -138,6 +140,25 @@ impl Net {
         let r = tokio::task::spawn_blocking(move || self.agent.lock().expect("net agent").drop_floating()).await;
         if let Ok(Err(e)) | Err(e) = r.map_err(anyhow::Error::from) {
             tracing::error!("fence: the floating addresses could not be taken off: {e:#}");
+        }
+    }
+
+    /// The node's traffic since the last heartbeat (G9.8), or none when connection tracking cannot be read.
+    pub async fn traffic(self: Arc<Self>) -> Option<v1::TrafficReport> {
+        use std::sync::atomic::Ordering;
+        let me = self.clone();
+        let r = tokio::task::spawn_blocking(move || me.agent.lock().expect("net agent").traffic()).await.map_err(anyhow::Error::from).and_then(|r| r);
+        match r {
+            Ok(t) => {
+                self.traffic_failed.store(false, Ordering::Relaxed);
+                Some(t)
+            }
+            Err(e) => {
+                if !self.traffic_failed.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("no traffic report (install conntrack for the live view): {e:#}");
+                }
+                None
+            }
         }
     }
 
