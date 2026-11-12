@@ -115,6 +115,13 @@ fn ports(list: &[v1::PortMapping]) -> Result<Ports> {
     Ok((exposed, bound))
 }
 
+/// The ports Docker publishes on this node for `r`: none for a workload on its stack's network, whose ports the
+/// routing mesh answers on every node (G10.2); they are checked all the same.
+fn published(r: &v1::RunContainer) -> Result<Ports> {
+    let p = ports(&r.ports)?;
+    Ok(if r.network_stack.is_empty() { p } else { Default::default() })
+}
+
 /// `source:target[:ro|rw]`, the source a volume name or an absolute path, the target absolute.
 fn valid_volume(v: &str) -> Result<()> {
     let parts: Vec<&str> = v.split(':').collect();
@@ -202,7 +209,7 @@ fn after_pull(pulled: Result<()>, here: bool) -> Result<bool> {
 pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     valid_workload(&r.workload_id)?;
     r.volumes.iter().try_for_each(|v| valid_volume(v))?;
-    let (exposed, bound) = ports(&r.ports)?;
+    let (exposed, bound) = published(r)?;
     let net = attach(r)?;
     if let Some(f) = find(d, &r.workload_id).await? {
         if f.generation == r.generation {
@@ -370,6 +377,18 @@ mod tests {
         assert!(matches!(after_pull(Ok(()), false), Ok(false)));
         assert!(matches!(after_pull(Err(anyhow!("no registry")), true), Ok(true)), "built or loaded here, never pushed");
         assert_eq!(after_pull(Err(anyhow!("pulling x: denied")), false).unwrap_err().to_string(), "pulling x: denied");
+    }
+
+    #[test]
+    fn docker_publishes_the_ports_only_of_a_workload_off_the_overlay() {
+        let p = vec![v1::PortMapping { host_port: 8088, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }];
+        let off = v1::RunContainer { workload_id: "w".into(), ports: p.clone(), ..Default::default() };
+        let (exposed, bound) = published(&off).unwrap();
+        assert!(exposed.contains_key("80/tcp") && bound.contains_key("80/tcp"));
+        let on = v1::RunContainer { network_stack: "web".into(), address: "10.240.1.2".into(), ..off };
+        let (exposed, bound) = published(&on).unwrap();
+        assert!(exposed.is_empty() && bound.is_empty(), "the mesh answers it on every node (G10.2)");
+        assert!(published(&v1::RunContainer { ports: vec![v1::PortMapping { container_port: 0, ..p[0].clone() }], ..on }).is_err(), "still checked");
     }
 
     #[test]
