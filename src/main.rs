@@ -15,6 +15,8 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&config.data_dir).with_context(|| format!("making {}", config.data_dir.display()))?;
     let files = Files::in_dir(&config.data_dir);
     let node_id = files.node_id()?;
+    // A renewal cut off before both its key and certificate were in place (G2.7).
+    files.finish_renewal()?;
     let hostname = hostname();
     tracing::info!(node = %node_id, %hostname, "freightdock-worker {}", env!("CARGO_PKG_VERSION"));
 

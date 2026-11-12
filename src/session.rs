@@ -108,7 +108,7 @@ impl Worker {
             },
         };
         tx.send(WorkerMessage { body: Some(worker_message::Body::Hello(hello)) }).await?;
-        let mut inbound = WorkerSessionClient::new(ch).open(ReceiverStream::new(rx)).await?.into_inner();
+        let mut inbound = WorkerSessionClient::new(ch.clone()).open(ReceiverStream::new(rx)).await?.into_inner();
 
         let welcome = match tokio::time::timeout(SILENT, inbound.message()).await {
             Ok(Ok(Some(v1::ManagerMessage { body: Some(manager_message::Body::Welcome(w)) }))) => w,
@@ -123,6 +123,16 @@ impl Worker {
         let every = Duration::from_millis(welcome.heartbeat_interval_ms.clamp(500, 30_000) as u64);
         tracing::info!(manager = %welcome.manager_id, cluster = %welcome.cluster_id, "connected to {addr}; heartbeat every {}ms", every.as_millis());
         self.exec.attach(Some(tx.clone()));
+        if welcome.renew_certificate {
+            // Its certificate expires within a year: a new one now, used from the next stream on.
+            let files = Files::in_dir(&self.config.data_dir);
+            tokio::spawn(async move {
+                match crate::enrol::renew(&files, ch).await {
+                    Ok(()) => tracing::info!("renewed this node's certificate; the next stream uses it"),
+                    Err(e) => tracing::warn!("{e:#} (tried again at the next stream)"),
+                }
+            });
+        }
 
         let beats = {
             let (tx, docker, fence, net) = (tx.clone(), self.docker.clone(), self.fence.clone(), self.net.clone());

@@ -64,6 +64,21 @@ pub async fn enrol(config: &Config, files: &Files, token: &str, hostname: &str) 
     Err(last)
 }
 
+/// A new key and certificate (G2.7), asked on `ch` (a channel made with the node's current certificate). Kept only
+/// when it comes from the cluster's own CA; the current ones stay good at the managers until the next renewal.
+pub async fn renew(files: &Files, ch: tonic::transport::Channel) -> Result<()> {
+    let key = rcgen::KeyPair::generate()?;
+    let csr = rcgen::CertificateParams::new(Vec::<String>::new())?.serialize_request(&key)?.pem()?;
+    let r = freightdock_proto::v1::worker_session_client::WorkerSessionClient::new(ch).renew(freightdock_proto::v1::RenewRequest { csr_pem: csr }).await.map_err(|s| anyhow!("renewing the certificate: {}", s.message()))?.into_inner();
+    let ours = CertificateDer::from_pem_file(&files.ca).context("the kept cluster CA")?;
+    let theirs = CertificateDer::from_pem_slice(r.ca_pem.as_bytes()).context("the CA the manager sent")?;
+    if sha256_hex(&ours) != sha256_hex(&theirs) {
+        bail!("the manager sent a certificate of another CA");
+    }
+    CertificateDer::from_pem_slice(r.cert_pem.as_bytes()).context("the renewed certificate")?;
+    files.keep_renewed(&key.serialize_pem(), &r.cert_pem)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

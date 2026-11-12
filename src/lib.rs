@@ -83,6 +83,41 @@ impl Files {
         Files { node_id: dir.join("node.id"), key: dir.join("key.pem"), cert: dir.join("cert.pem"), ca: dir.join("ca.pem"), managers: dir.join("managers"), spent: dir.join("token.sha256") }
     }
 
+    /// Where a renewed key and certificate are kept, whole, until both are in place (G2.7).
+    pub fn renewal(&self) -> PathBuf {
+        self.key.with_file_name("renewal.json")
+    }
+
+    /// Keeps a renewed key and certificate: first both in one file (written aside and renamed, so it is there whole
+    /// or not at all), then each in its place. Cut off between, the next start finishes it (`finish_renewal`).
+    pub fn keep_renewed(&self, key_pem: &str, cert_pem: &str) -> Result<()> {
+        let tmp = self.renewal().with_extension("json.tmp");
+        write_private(&tmp, serde_json::json!({ "key_pem": key_pem, "cert_pem": cert_pem }).to_string().as_bytes())?;
+        std::fs::rename(&tmp, self.renewal()).context("keeping the renewal")?;
+        self.finish_renewal()
+    }
+
+    /// Puts a kept renewal's key and certificate in place, if there is one; doing it again does the same.
+    pub fn finish_renewal(&self) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Kept {
+            key_pem: String,
+            cert_pem: String,
+        }
+        let Ok(text) = std::fs::read_to_string(self.renewal()) else { return Ok(()) };
+        let k: Kept = serde_json::from_str(&text).context("the kept renewal")?;
+        let put = |path: &Path, bytes: &str| -> Result<()> {
+            let tmp = path.with_extension("pem.tmp");
+            write_private(&tmp, bytes.as_bytes())?;
+            std::fs::rename(&tmp, path).with_context(|| format!("putting {} in place", path.display()))
+        };
+        put(&self.key, &k.key_pem)?;
+        put(&self.cert, &k.cert_pem)?;
+        std::fs::remove_file(self.renewal()).context("done with the renewal")?;
+        tracing::info!("the renewed certificate is in place");
+        Ok(())
+    }
+
     pub fn enrolled(&self) -> bool {
         self.key.exists() && self.cert.exists() && self.ca.exists()
     }
@@ -137,6 +172,31 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renewal_is_kept_whole_or_not_at_all_and_finished_at_the_next_start() {
+        let d = tempfile::tempdir().unwrap();
+        let f = Files::in_dir(d.path());
+        std::fs::write(&f.key, "old key").unwrap();
+        std::fs::write(&f.cert, "old cert").unwrap();
+        f.keep_renewed("new key", "new cert").unwrap();
+        assert_eq!((std::fs::read_to_string(&f.key).unwrap(), std::fs::read_to_string(&f.cert).unwrap()), ("new key".into(), "new cert".into()));
+        assert!(!f.renewal().exists(), "done with");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&f.key).unwrap().permissions().mode() & 0o777, 0o600, "the key only root reads");
+        }
+        // Cut off after the renewal was kept, before both were in place: the next start puts them there.
+        std::fs::write(f.renewal(), serde_json::json!({ "key_pem": "k3", "cert_pem": "c3" }).to_string()).unwrap();
+        std::fs::write(&f.cert, "c3").unwrap();
+        f.finish_renewal().unwrap();
+        assert_eq!((std::fs::read_to_string(&f.key).unwrap(), std::fs::read_to_string(&f.cert).unwrap()), ("k3".into(), "c3".into()));
+        // Cut off while it was written: nothing is taken from half a file.
+        std::fs::write(d.path().join("renewal.json.tmp"), "{\"key_pem\": \"k4").unwrap();
+        f.finish_renewal().unwrap();
+        assert_eq!(std::fs::read_to_string(&f.key).unwrap(), "k3");
+    }
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())

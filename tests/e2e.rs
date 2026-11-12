@@ -83,6 +83,18 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     until("the ping's end", || m.store.read(|s| (s.commands["c1"].status == CommandStatus::Succeeded).then_some(()))).await;
     assert!(m.store.read(|s| s.commands["c1"].result_json.contains("pong")));
 
+    // G2.7: a new certificate, asked with the current one; the worker comes back with it, and the old one still opens.
+    let before = m.store.read(|s| s.nodes[&node_id].cert_sha256.clone());
+    let ch = freightdock_worker::tls::channel(&format!("127.0.0.1:{port}"), freightdock_worker::tls::mutual(&w.files).unwrap()).await.unwrap();
+    freightdock_worker::enrol::renew(&w.files, ch).await.unwrap();
+    let after = m.store.read(|s| s.nodes[&node_id].cert_sha256.clone());
+    assert_ne!(before, after);
+    let kept: rustls::pki_types::CertificateDer = rustls::pki_types::pem::PemObject::from_pem_file(&w.files.cert).unwrap();
+    assert_eq!(freightdock_proto::sha256_hex(&kept), after, "the worker keeps the one the managers know");
+    assert!(m.store.read(|s| s.node_by_cert(&before).is_some()), "the old one too, until the next renewal");
+    m.sessions.kick_all();
+    until("the worker back with its new certificate", || (m.sessions.liveness(&node_id).health == Health::Healthy).then_some(())).await;
+
     // The manager goes away and comes back with its state; the worker finds it again.
     m.sessions.kick_all();
     server.abort();
