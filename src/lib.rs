@@ -8,6 +8,7 @@
 pub mod docker;
 pub mod enrol;
 pub mod exec;
+pub mod fence;
 pub mod host;
 pub mod session;
 pub mod tls;

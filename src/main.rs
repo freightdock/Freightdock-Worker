@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 
 use freightdock_worker::exec::Executor;
+use freightdock_worker::fence::Fence;
 use freightdock_worker::host::{Probe, hostname};
 use freightdock_worker::session::Worker;
 use freightdock_worker::{Config, Files, enrol};
@@ -34,7 +37,18 @@ async fn main() -> Result<()> {
         }
     };
     let exec = Executor::new(node_id.clone(), docker.clone(), Some(config.data_dir.join("commands.json")));
-    let w = Worker { config, files, node_id, hostname, docker, exec, probe: Probe::default(), contact: Default::default() };
+    let (enabled, reboot, timers) = freightdock_worker::fence::config(|k| std::env::var(k).ok())?;
+    let fence = Arc::new(Fence::open(Some(config.data_dir.join("fence.json")), freightdock_worker::host::boot_id(), timers, reboot, enabled));
+    if !enabled {
+        tracing::warn!("self-fencing is off (FREIGHTDOCK_FENCE=off): this node keeps running its workloads without any manager");
+    }
+    if let Some(f) = fence.fenced() {
+        tracing::warn!("fenced ({}): no managed workload starts until the managers authorize this node", f.reason);
+    }
+    exec.guard(fence.clone());
+    tokio::spawn(freightdock_worker::fence::watch(fence.clone(), docker.clone()));
+    freightdock_worker::fence::notify("READY=1");
+    let w = Worker { config, files, node_id, hostname, docker, exec, probe: Probe::default(), fence };
     tokio::select! {
         r = w.run() => r,
         _ = tokio::signal::ctrl_c() => { tracing::info!("stopping"); Ok(()) }

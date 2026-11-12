@@ -13,7 +13,7 @@ use freightdock_worker::session::Worker;
 use freightdock_worker::{Config, Files, enrol};
 
 async fn manager(dir: &std::path::Path, port: u16) -> (Arc<Manager>, tokio::task::JoinHandle<()>) {
-    let config = MConfig { data_dir: dir.into(), bind: format!("127.0.0.1:{port}").parse().unwrap(), api_bind: None, advertise: vec![format!("127.0.0.1:{port}")], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: None };
+    let config = MConfig { data_dir: dir.into(), bind: format!("127.0.0.1:{port}").parse().unwrap(), api_bind: None, advertise: vec![format!("127.0.0.1:{port}")], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: None, fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     let l = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let h = tokio::spawn({
@@ -64,7 +64,7 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     assert!(err.to_string().contains("used"), "{err}");
 
     let exec = Executor::new(node_id.clone(), None, Some(wdir.path().join("commands.json")));
-    let w = Arc::new(Worker { config, files, node_id: node_id.clone(), hostname: "test-host".into(), docker: None, exec, probe: Probe::default(), contact: Default::default() });
+    let w = Arc::new(Worker { config, files, node_id: node_id.clone(), hostname: "test-host".into(), docker: None, exec, probe: Probe::default(), fence: Arc::new(freightdock_worker::fence::Fence::open(None, "boot".into(), Default::default(), freightdock_worker::fence::RebootPolicy::Never, true)) });
     let run = tokio::spawn({
         let w = w.clone();
         async move { w.run().await }

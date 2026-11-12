@@ -2,6 +2,8 @@
 Description=Freightdock worker-agent
 After=network-online.target docker.service
 Wants=network-online.target docker.service
+# Started again however often (see the watchdog below).
+StartLimitIntervalSec=0
 
 [Service]
 # Settings in /etc/freightdock/worker.env, e.g.
@@ -11,6 +13,12 @@ Wants=network-online.target docker.service
 EnvironmentFile=-/etc/freightdock/worker.env
 Environment=FREIGHTDOCK_WORKER_DATA=/var/lib/freightdock-worker
 ExecStart=/usr/local/bin/freightdock-worker
+# The watchdog (G6.3): the worker says it is alive every second from its fencing loop; one that stops saying so for
+# 30s is killed and started again, and carries on its fencing countdown from where it was (kept on disk). Restarted
+# however often: a node is not rebooted over a worker that will not start.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
 Restart=always
 RestartSec=2
 StateDirectory=freightdock-worker

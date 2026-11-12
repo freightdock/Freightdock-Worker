@@ -15,6 +15,7 @@ use freightdock_proto::v1;
 
 pub const LABEL_MANAGED: &str = "io.freightdock.managed";
 pub const LABEL_WORKLOAD: &str = "io.freightdock.workload";
+pub const LABEL_GENERATION: &str = "io.freightdock.generation";
 
 pub fn connect(socket: &Path) -> Result<Docker> {
     Ok(Docker::connect_with_unix(&socket.to_string_lossy(), 120, bollard::API_DEFAULT_VERSION)?)
@@ -50,11 +51,78 @@ pub fn split_tag(image: &str) -> (&str, &str) {
     }
 }
 
-/// The container of `workload`, if this worker has one: (id, running).
-async fn find(d: &Docker, workload: &str) -> Result<Option<(String, bool)>> {
+/// A container of `workload` on this worker: its id, whether it runs, and the generation it was made for.
+struct Found {
+    id: String,
+    up: bool,
+    generation: u64,
+}
+
+fn generation_of(labels: Option<&HashMap<String, String>>) -> u64 {
+    labels.and_then(|l| l.get(LABEL_GENERATION)).and_then(|g| g.parse().ok()).unwrap_or(0)
+}
+
+/// The container of `workload`, if this worker has one.
+async fn find(d: &Docker, workload: &str) -> Result<Option<Found>> {
     let f = HashMap::from([("label".to_string(), vec![format!("{LABEL_WORKLOAD}={workload}")])]);
     let l = d.list_containers(Some(q::ListContainersOptions { all: true, filters: Some(f), ..Default::default() })).await?;
-    Ok(l.into_iter().next().map(|c| (c.id.unwrap_or_default(), c.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING))))
+    Ok(l.into_iter().next().map(|c| Found { generation: generation_of(c.labels.as_ref()), up: c.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING), id: c.id.unwrap_or_default() }))
+}
+
+/// Every managed container here, for the heartbeat; `None` when Docker does not answer (the manager then acts on
+/// nothing it cannot see).
+pub async fn workloads(d: &Docker) -> Option<v1::WorkloadReport> {
+    let f = HashMap::from([("label".to_string(), vec![format!("{LABEL_MANAGED}=true")])]);
+    let l = d.list_containers(Some(q::ListContainersOptions { all: true, filters: Some(f), ..Default::default() })).await.ok()?;
+    let workloads = l
+        .into_iter()
+        .filter_map(|c| {
+            let workload_id = c.labels.as_ref()?.get(LABEL_WORKLOAD)?.clone();
+            Some(v1::WorkloadState {
+                workload_id,
+                generation: generation_of(c.labels.as_ref()),
+                container_id: c.id.unwrap_or_default(),
+                state: c.state.map(|s| s.to_string()).unwrap_or_default(),
+                exit_code: exit_code(c.status.as_deref().unwrap_or("")),
+                image: c.image.unwrap_or_default(),
+            })
+        })
+        .collect();
+    Some(v1::WorkloadReport { workloads })
+}
+
+/// The code in Docker's status line, "Exited (137) 5 minutes ago"; 0 for any other line.
+fn exit_code(status: &str) -> i32 {
+    status.strip_prefix("Exited (").and_then(|r| r.split(')').next()).and_then(|c| c.parse().ok()).unwrap_or(0)
+}
+
+/// The published ports, as Docker wants them: the exposed set and the bindings.
+type Ports = (HashMap<String, HashMap<(), ()>>, bollard::models::PortMap);
+
+fn ports(list: &[v1::PortMapping]) -> Result<Ports> {
+    let mut exposed = HashMap::new();
+    let mut bound: bollard::models::PortMap = HashMap::new();
+    for p in list {
+        let proto = if p.protocol.is_empty() { "tcp" } else { p.protocol.as_str() };
+        if !matches!(proto, "tcp" | "udp") || p.container_port == 0 || p.container_port > 65535 || p.host_port > 65535 {
+            return Err(anyhow!("a port must be 1 to 65535 over tcp or udp"));
+        }
+        let key = format!("{}/{proto}", p.container_port);
+        exposed.insert(key.clone(), HashMap::new());
+        let b = bollard::models::PortBinding { host_ip: (!p.host_ip.is_empty()).then(|| p.host_ip.clone()), host_port: (p.host_port != 0).then(|| p.host_port.to_string()) };
+        bound.entry(key).or_insert_with(|| Some(vec![])).get_or_insert_with(Vec::new).push(b);
+    }
+    Ok((exposed, bound))
+}
+
+/// `source:target[:ro|rw]`, the source a volume name or an absolute path, the target absolute.
+fn valid_volume(v: &str) -> Result<()> {
+    let parts: Vec<&str> = v.split(':').collect();
+    let ok = match parts.as_slice() {
+        [src, dst] | [src, dst, "ro" | "rw"] => !src.is_empty() && dst.starts_with('/') && (src.starts_with('/') || src.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))),
+        _ => false,
+    };
+    if ok { Ok(()) } else { Err(anyhow!("{v:?} is not a volume as source:target[:ro]")) }
 }
 
 fn valid_workload(id: &str) -> Result<()> {
@@ -66,11 +134,17 @@ fn valid_workload(id: &str) -> Result<()> {
 
 pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     valid_workload(&r.workload_id)?;
-    if let Some((id, up)) = find(d, &r.workload_id).await? {
-        if !up {
-            d.start_container(&id, None::<q::StartContainerOptions>).await.context("starting the workload's container")?;
+    r.volumes.iter().try_for_each(|v| valid_volume(v))?;
+    let (exposed, bound) = ports(&r.ports)?;
+    if let Some(f) = find(d, &r.workload_id).await? {
+        if f.generation == r.generation {
+            if !f.up {
+                d.start_container(&f.id, None::<q::StartContainerOptions>).await.context("starting the workload's container")?;
+            }
+            return Ok(json!({ "container_id": f.id, "created": false }));
         }
-        return Ok(json!({ "container_id": id, "created": false }));
+        // Made for another spec: made again.
+        d.remove_container(&f.id, Some(q::RemoveContainerOptions { force: true, ..Default::default() })).await.context("removing the container of the old spec")?;
     }
     let (from_image, tag) = split_tag(&r.image);
     let mut pull = d.create_image(Some(q::CreateImageOptions { from_image: Some(from_image.to_string()), tag: Some(tag.to_string()), ..Default::default() }), None, None);
@@ -83,14 +157,23 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     let mut labels = r.labels.clone();
     labels.insert(LABEL_MANAGED.into(), "true".into());
     labels.insert(LABEL_WORKLOAD.into(), r.workload_id.clone());
+    labels.insert(LABEL_GENERATION.into(), r.generation.to_string());
     let body = ContainerCreateBody {
         image: Some(r.image.clone()),
         cmd: (!r.command.is_empty()).then(|| r.command.clone()),
         env: Some(r.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
         labels: Some(labels),
+        exposed_ports: (!exposed.is_empty()).then_some(exposed),
         // Never restarted by Docker on its own: a managed workload restarts only when the cluster says so, which is
         // what keeps a fenced worker from bringing its containers back after a reboot.
-        host_config: Some(HostConfig { restart_policy: Some(RestartPolicy { name: Some(RestartPolicyNameEnum::NO), maximum_retry_count: None }), ..Default::default() }),
+        host_config: Some(HostConfig {
+            restart_policy: Some(RestartPolicy { name: Some(RestartPolicyNameEnum::NO), maximum_retry_count: None }),
+            port_bindings: (!bound.is_empty()).then_some(bound),
+            binds: (!r.volumes.is_empty()).then(|| r.volumes.clone()),
+            nano_cpus: (r.cpu_millis > 0).then(|| r.cpu_millis as i64 * 1_000_000),
+            memory: (r.memory_bytes > 0).then_some(r.memory_bytes as i64),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let name = (!r.name.is_empty()).then(|| r.name.clone());
@@ -99,9 +182,22 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     Ok(json!({ "container_id": made.id, "created": true }))
 }
 
+/// Stops every managed container that runs (the fence at N). Answers how many still run after.
+pub async fn stop_all(d: &Docker) -> Result<usize> {
+    let f = HashMap::from([("label".to_string(), vec![format!("{LABEL_MANAGED}=true")]), ("status".to_string(), vec!["running".to_string()])]);
+    let list = |f: HashMap<String, Vec<String>>| d.list_containers(Some(q::ListContainersOptions { filters: Some(f), ..Default::default() }));
+    for c in list(f.clone()).await? {
+        let id = c.id.unwrap_or_default();
+        if let Err(e) = d.stop_container(&id, Some(q::StopContainerOptions { t: Some(10), signal: None })).await {
+            tracing::warn!(container = %id, "fence: stopping: {e}");
+        }
+    }
+    Ok(list(f).await?.len())
+}
+
 pub async fn stop(d: &Docker, s: &v1::StopContainer) -> Result<Value> {
     valid_workload(&s.workload_id)?;
-    let Some((id, up)) = find(d, &s.workload_id).await? else { return Ok(json!({ "container_id": null })) };
+    let Some(Found { id, up, .. }) = find(d, &s.workload_id).await? else { return Ok(json!({ "container_id": null })) };
     if up {
         let t = if s.timeout_s == 0 { 10 } else { s.timeout_s.min(600) as i32 };
         match d.stop_container(&id, Some(q::StopContainerOptions { t: Some(t), signal: None })).await {
@@ -114,7 +210,7 @@ pub async fn stop(d: &Docker, s: &v1::StopContainer) -> Result<Value> {
 
 pub async fn remove(d: &Docker, r: &v1::RemoveContainer) -> Result<Value> {
     valid_workload(&r.workload_id)?;
-    let Some((id, _)) = find(d, &r.workload_id).await? else { return Ok(json!({ "container_id": null })) };
+    let Some(Found { id, .. }) = find(d, &r.workload_id).await? else { return Ok(json!({ "container_id": null })) };
     d.remove_container(&id, Some(q::RemoveContainerOptions { force: true, ..Default::default() })).await.context("removing the container")?;
     Ok(json!({ "container_id": id }))
 }
@@ -129,6 +225,34 @@ mod tests {
         assert_eq!(split_tag("ghcr.io:443/a/b:1.2"), ("ghcr.io:443/a/b", "1.2"));
         assert_eq!(split_tag("ghcr.io:443/a/b"), ("ghcr.io:443/a/b", "latest"));
         assert_eq!(split_tag("a@sha256:abc"), ("a@sha256:abc", ""));
+    }
+
+    #[test]
+    fn the_exit_code_is_read_from_docker_s_status_line() {
+        assert_eq!(exit_code("Exited (137) 5 minutes ago"), 137);
+        assert_eq!(exit_code("Up 3 hours"), 0);
+        assert_eq!(exit_code(""), 0);
+    }
+
+    #[test]
+    fn ports_become_exposed_ports_and_bindings() {
+        let p = |h, c, proto: &str| v1::PortMapping { host_port: h, container_port: c, protocol: proto.into(), host_ip: String::new() };
+        let (exposed, bound) = ports(&[p(8080, 80, ""), p(5353, 53, "udp"), p(0, 9000, "tcp")]).unwrap();
+        assert!(exposed.contains_key("80/tcp") && exposed.contains_key("53/udp") && exposed.contains_key("9000/tcp"));
+        assert_eq!(bound["80/tcp"].as_ref().unwrap()[0].host_port.as_deref(), Some("8080"));
+        assert_eq!(bound["9000/tcp"].as_ref().unwrap()[0].host_port, None, "0: any free port");
+        assert!(ports(&[p(1, 0, "")]).is_err());
+        assert!(ports(&[p(1, 80, "sctp")]).is_err());
+    }
+
+    #[test]
+    fn volumes_are_source_target_and_an_optional_mode() {
+        assert!(valid_volume("data:/var/lib/data").is_ok());
+        assert!(valid_volume("/srv/www:/usr/share/nginx/html:ro").is_ok());
+        assert!(valid_volume("data:relative").is_err());
+        assert!(valid_volume("../x:/y").is_err());
+        assert!(valid_volume("a:/b:rx").is_err());
+        assert!(valid_volume("/only").is_err());
     }
 
     #[test]

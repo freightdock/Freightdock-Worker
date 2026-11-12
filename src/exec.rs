@@ -28,6 +28,8 @@ pub struct Executor {
     known: Mutex<HashMap<String, Kept>>,
     out: Mutex<Option<mpsc::Sender<WorkerMessage>>>,
     journal: Option<PathBuf>,
+    /// While it says fenced, no managed workload is started (plan 7.4).
+    fence: std::sync::OnceLock<Arc<crate::fence::Fence>>,
 }
 
 /// A command's last update, as kept on disk.
@@ -62,7 +64,7 @@ impl Executor {
             tracing::warn!(command = %id, "was running when the worker stopped; reported failed");
             *k = Kept { status: CommandStatus::Failed as i32, message: "the worker restarted while running it".into(), result_json: String::new(), at_ms: now_ms() };
         }
-        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal };
+        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default() };
         e.save(&e.known.lock().expect("known lock"));
         Arc::new(e)
     }
@@ -74,6 +76,11 @@ impl Executor {
         if let Err(e) = write {
             tracing::warn!("keeping the command journal in {}: {e}", p.display());
         }
+    }
+
+    /// The fence that keeps runs from starting while the node is fenced.
+    pub fn guard(&self, f: Arc<crate::fence::Fence>) {
+        let _ = self.fence.set(f);
     }
 
     /// The stream updates go to from now on; `None` when there is none.
@@ -119,6 +126,9 @@ impl Executor {
             return self.report(&id, CommandStatus::Expired, "its deadline passed before it reached this worker", String::new());
         }
         let Some(op) = c.op else { return self.report(&id, CommandStatus::Rejected, "an operation this worker does not know", String::new()) };
+        if matches!(op, Op::RunContainer(_)) && self.fence.get().is_some_and(|f| f.fenced().is_some()) {
+            return self.report(&id, CommandStatus::Rejected, "this node is fenced and waits for the managers to authorize it", String::new());
+        }
         self.report(&id, CommandStatus::Received, "", String::new());
         let me = self.clone();
         tokio::spawn(async move {
@@ -209,6 +219,28 @@ mod tests {
         let u = updates(&mut rx, true).await;
         assert_eq!(u.last().map(|u| u.0), Some(CommandStatus::Failed as i32));
         assert!(u.last().unwrap().1.contains("no Docker"));
+    }
+
+    #[tokio::test]
+    async fn a_fenced_worker_starts_nothing_but_still_stops() {
+        let e = Executor::new("n1".into(), None, None);
+        let f = Arc::new(crate::fence::Fence::open(None, "b".into(), Default::default(), crate::fence::RebootPolicy::Never, true));
+        e.guard(f.clone());
+        f.enter("test");
+        let (tx, mut rx) = mpsc::channel(16);
+        e.attach(Some(tx));
+        let run = v1::RunContainer { workload_id: "w".into(), image: "nginx".into(), ..Default::default() };
+        e.handle(cmd("c1", "n1", Op::RunContainer(run.clone())));
+        let u = updates(&mut rx, true).await;
+        assert_eq!(u.last().map(|u| u.0), Some(CommandStatus::Rejected as i32));
+        assert!(u.last().unwrap().1.contains("fenced"));
+        e.handle(cmd("c2", "n1", Op::StopContainer(v1::StopContainer { workload_id: "w".into(), timeout_s: 1 })));
+        let u = updates(&mut rx, true).await;
+        assert_eq!(u.last().map(|u| u.0), Some(CommandStatus::Failed as i32), "a stop is tried (and fails here only for want of Docker)");
+        f.clear();
+        e.handle(cmd("c3", "n1", Op::RunContainer(run)));
+        let u = updates(&mut rx, true).await;
+        assert!(!u.last().unwrap().1.contains("fenced"));
     }
 
     #[tokio::test]

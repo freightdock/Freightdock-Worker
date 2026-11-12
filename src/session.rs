@@ -5,7 +5,7 @@
 //! all come back at once.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use rand::RngExt;
@@ -22,27 +22,6 @@ use crate::{Config, Files};
 const SILENT: Duration = Duration::from_secs(10);
 const MAX_WAIT: Duration = Duration::from_secs(30);
 
-/// When this worker last heard from any manager. Starts at the process start, so a worker that never reaches a manager
-/// counts from then. Self-fencing (G6) runs its timers from this, not from when a dial failed: a half-open connection can
-/// hide a dead link for many seconds before any dial is tried.
-pub struct Contact(std::sync::Mutex<Instant>);
-
-impl Default for Contact {
-    fn default() -> Self {
-        Contact(std::sync::Mutex::new(Instant::now()))
-    }
-}
-
-impl Contact {
-    pub fn heard(&self) {
-        *self.0.lock().expect("contact lock") = Instant::now();
-    }
-
-    pub fn silent_for(&self) -> Duration {
-        self.0.lock().expect("contact lock").elapsed()
-    }
-}
-
 pub struct Worker {
     pub config: Config,
     pub files: Files,
@@ -51,7 +30,13 @@ pub struct Worker {
     pub docker: Option<bollard::Docker>,
     pub exec: Arc<Executor>,
     pub probe: Probe,
-    pub contact: Contact,
+    /// The self-fencing state and the countdown from the last word of any manager.
+    pub fence: Arc<crate::fence::Fence>,
+}
+
+/// What the hello and heartbeats say of the fence.
+pub fn fencing_state(f: &crate::fence::Fence) -> FencingState {
+    if f.fenced().is_some() { FencingState::AwaitingAuthorization } else { FencingState::None }
 }
 
 /// The wait after `failed_rounds` rounds in which no manager would talk.
@@ -85,7 +70,7 @@ impl Worker {
             }
             // Phase 7 turns this into the self-fencing countdown (stop managed workloads at N, storage at N+X, reboot
             // at N+X+Y). Until then it is only said.
-            tracing::warn!("no manager heard from for {}s", self.contact.silent_for().as_secs());
+            tracing::warn!("no manager heard from for {}s", self.fence.silent_for().as_secs());
             let wait = backoff(failed_rounds, rand::rng().random_range(0.75..1.25));
             failed_rounds = failed_rounds.saturating_add(1);
             tokio::time::sleep(wait).await;
@@ -109,11 +94,15 @@ impl Worker {
             hostname: self.hostname.clone(),
             agent_version: env!("CARGO_PKG_VERSION").into(),
             boot_id: crate::host::boot_id(),
-            fencing_state: FencingState::None as i32,
+            fencing_state: fencing_state(&self.fence) as i32,
             labels: self.config.labels.clone().into_iter().collect(),
             resources: Some(self.probe.resources(running)),
             capabilities: Some(crate::host::capabilities(docker_version)),
             in_flight: self.exec.in_flight(),
+            workloads: match &self.docker {
+                Some(d) => crate::docker::workloads(d).await,
+                None => None,
+            },
         };
         tx.send(WorkerMessage { body: Some(worker_message::Body::Hello(hello)) }).await?;
         let mut inbound = WorkerSessionClient::new(ch).open(ReceiverStream::new(rx)).await?.into_inner();
@@ -125,14 +114,15 @@ impl Worker {
             _ => bail!("the manager's first message was not a welcome"),
         };
         *talked = true;
-        self.contact.heard();
+        self.fence.heard();
         self.files.keep_managers(&welcome.managers);
+        self.fence.set_timers(self.fence.timers().with_welcome(welcome.fence_stop_s, welcome.fence_storage_s, welcome.fence_reboot_s));
         let every = Duration::from_millis(welcome.heartbeat_interval_ms.clamp(500, 30_000) as u64);
         tracing::info!(manager = %welcome.manager_id, cluster = %welcome.cluster_id, "connected to {addr}; heartbeat every {}ms", every.as_millis());
         self.exec.attach(Some(tx.clone()));
 
         let beats = {
-            let (tx, docker) = (tx.clone(), self.docker.clone());
+            let (tx, docker, fence) = (tx.clone(), self.docker.clone(), self.fence.clone());
             let probe = Probe::default();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(every);
@@ -146,7 +136,11 @@ impl Worker {
                         None => 0,
                     };
                     let sent_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)) };
+                    let workloads = match &docker {
+                        Some(d) => crate::docker::workloads(d).await,
+                        None => None,
+                    };
+                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, fencing_state: fencing_state(&fence) as i32 };
                     if tx.send(WorkerMessage { body: Some(worker_message::Body::Heartbeat(hb)) }).await.is_err() {
                         break;
                     }
@@ -157,7 +151,7 @@ impl Worker {
         let end = loop {
             let next = tokio::time::timeout(SILENT, inbound.message()).await;
             if matches!(next, Ok(Ok(Some(_)))) {
-                self.contact.heard();
+                self.fence.heard();
             }
             match next {
                 Ok(Ok(Some(m))) => match m.body {
@@ -166,6 +160,12 @@ impl Worker {
                         self.exec.handle(c);
                     }
                     Some(manager_message::Body::HeartbeatAck(_)) => {}
+                    Some(manager_message::Body::Authorize(a)) => {
+                        if let Some(f) = self.fence.fenced() {
+                            tracing::warn!(by = %a.by, "authorized by the managers again (fenced since {}: {})", f.at_ms, f.reason);
+                            self.fence.clear();
+                        }
+                    }
                     Some(manager_message::Body::Welcome(w)) => self.files.keep_managers(&w.managers),
                     None => {}
                 },
@@ -183,15 +183,6 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn contact_counts_from_the_last_word() {
-        let c = Contact::default();
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(c.silent_for() >= Duration::from_millis(30));
-        c.heard();
-        assert!(c.silent_for() < Duration::from_millis(30));
-    }
 
     #[test]
     fn the_wait_doubles_to_thirty_seconds() {
