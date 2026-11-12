@@ -18,12 +18,8 @@ pub fn network_name(stack: &str) -> String {
     format!("fd-{stack}")
 }
 
-/// The stack's bridge: `fd-<stack>`, or for a stack whose name makes that longer than Linux's 15 characters,
-/// `fd-` and twelve hex characters of its name's hash. Always `fd-...`, which the agent's masquerade leaves alone.
-pub fn bridge_name(stack: &str) -> String {
-    let n = network_name(stack);
-    if n.len() <= 15 { n } else { format!("fd-{}", &freightdock_proto::sha256_hex(stack.as_bytes())[..12]) }
-}
+/// The stack's bridge (Freightdock-Network's name for it, so the agent's rules and Docker's bridge agree).
+pub use freightdock_network::plan::bridge_name;
 
 /// The stack's /24 and its gateway, from a workload's address in it (the managers give each stack a /24 with the
 /// gateway at `.1`, and workloads from `.2`).
@@ -157,14 +153,9 @@ mod tests {
     }
 
     #[test]
-    fn a_bridge_name_fits_linux_and_starts_with_fd() {
-        assert_eq!(bridge_name("web"), "fd-web");
-        assert_eq!(bridge_name("twelve-chars"), "fd-twelve-chars");
-        let long = bridge_name("a-rather-long-stack-name");
-        assert!(long.len() <= 15 && long.starts_with("fd-"), "{long}");
-        assert_ne!(long, bridge_name("a-rather-long-stack-name2"));
-        assert_eq!(long, bridge_name("a-rather-long-stack-name"), "the same every time");
-        assert_eq!(network_name("a-rather-long-stack-name"), "fd-a-rather-long-stack-name", "Docker's name is whole");
+    fn docker_s_network_name_is_whole_and_its_bridge_fits_linux() {
+        assert_eq!(network_name("a-rather-long-stack-name"), "fd-a-rather-long-stack-name");
+        assert!(bridge_name("a-rather-long-stack-name").len() <= 15);
     }
 
     #[test]
