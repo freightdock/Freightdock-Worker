@@ -46,9 +46,19 @@ async fn main() -> Result<()> {
         tracing::warn!("fenced ({}): no managed workload starts until the managers authorize this node", f.reason);
     }
     exec.guard(fence.clone());
+    let net = match freightdock_worker::net::Net::open(&config.data_dir) {
+        Ok(n) => {
+            exec.with_net(n.clone());
+            Some(n)
+        }
+        Err(e) => {
+            tracing::warn!("no overlay on this node: {e:#}");
+            None
+        }
+    };
     tokio::spawn(freightdock_worker::fence::watch(fence.clone(), docker.clone()));
     freightdock_worker::fence::notify("READY=1");
-    let w = Worker { config, files, node_id, hostname, docker, exec, probe: Probe::default(), fence };
+    let w = Worker { config, files, node_id, hostname, docker, exec, probe: Probe::default(), fence, net };
     tokio::select! {
         r = w.run() => r,
         _ = tokio::signal::ctrl_c() => { tracing::info!("stopping"); Ok(()) }

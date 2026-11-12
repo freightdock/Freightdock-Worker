@@ -132,6 +132,51 @@ fn valid_workload(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// How a workload of a stack is attached (G9): its stack's network, its fixed address, its stack's names.
+#[derive(Debug)]
+pub struct Attach {
+    pub stack: String,
+    pub network_mode: String,
+    pub hosts: Vec<String>,
+    pub config: bollard::models::NetworkingConfig,
+}
+
+/// The network part of `r`; `None` for a workload of no stack (Docker's default network, as before G9).
+pub fn attach(r: &v1::RunContainer) -> Result<Option<Attach>> {
+    if r.network_stack.is_empty() {
+        return Ok(None);
+    }
+    valid_workload(&r.network_stack).map_err(|_| anyhow!("{:?} is not a stack's name", r.network_stack))?;
+    crate::net::stack_net(&r.address)?;
+    if let Some(h) = r.hosts.iter().find(|h| !crate::net::valid_host(h)) {
+        return Err(anyhow!("{h:?} is not a host as name:address"));
+    }
+    let name = crate::net::network_name(&r.network_stack);
+    let ep = bollard::models::EndpointSettings { ipam_config: Some(bollard::models::EndpointIpamConfig { ipv4_address: Some(r.address.clone()), ..Default::default() }), ..Default::default() };
+    Ok(Some(Attach { stack: r.network_stack.clone(), network_mode: name.clone(), hosts: r.hosts.clone(), config: bollard::models::NetworkingConfig { endpoints_config: Some(HashMap::from([(name, ep)])) } }))
+}
+
+/// The stack's network on this node, made when it is not there; one made for another subnet is an error, never
+/// changed under the containers on it. Answers whether it was made now.
+pub async fn ensure_network(d: &Docker, stack: &str, address: &str) -> Result<bool> {
+    let want = crate::net::network_request(stack, address, crate::net::MTU)?;
+    let subnet = want.ipam.as_ref().and_then(|i| i.config.as_ref()).and_then(|c| c[0].subnet.clone());
+    match d.inspect_network(&want.name, None::<q::InspectNetworkOptions>).await {
+        Ok(n) => {
+            let have = n.ipam.and_then(|i| i.config).and_then(|c| c.into_iter().next()).and_then(|c| c.subnet);
+            if have != subnet {
+                return Err(anyhow!("the network {} is for {}, not {}", want.name, have.unwrap_or_default(), subnet.unwrap_or_default()));
+            }
+            Ok(false)
+        }
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+            d.create_network(want).await.with_context(|| format!("making the network of stack {stack}"))?;
+            Ok(true)
+        }
+        Err(e) => Err(e).context("asking Docker for the stack's network"),
+    }
+}
+
 async fn pull(d: &Docker, image: &str) -> Result<()> {
     let (from_image, tag) = split_tag(image);
     let mut pull = d.create_image(Some(q::CreateImageOptions { from_image: Some(from_image.to_string()), tag: Some(tag.to_string()), ..Default::default() }), None, None);
@@ -158,6 +203,7 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     valid_workload(&r.workload_id)?;
     r.volumes.iter().try_for_each(|v| valid_volume(v))?;
     let (exposed, bound) = ports(&r.ports)?;
+    let net = attach(r)?;
     if let Some(f) = find(d, &r.workload_id).await? {
         if f.generation == r.generation {
             if !f.up {
@@ -172,6 +218,9 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     let here = pulled.is_err() && d.inspect_image(&r.image).await.is_ok();
     if after_pull(pulled, here)? {
         tracing::warn!(image = %r.image, "could not pull it; running the image already on this node");
+    }
+    if let Some(a) = &net {
+        ensure_network(d, &a.stack, &r.address).await?;
     }
     let mut labels = r.labels.clone();
     labels.insert(LABEL_MANAGED.into(), "true".into());
@@ -191,8 +240,11 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
             binds: (!r.volumes.is_empty()).then(|| r.volumes.clone()),
             nano_cpus: (r.cpu_millis > 0).then(|| r.cpu_millis as i64 * 1_000_000),
             memory: (r.memory_bytes > 0).then_some(r.memory_bytes as i64),
+            network_mode: net.as_ref().map(|a| a.network_mode.clone()),
+            extra_hosts: net.as_ref().filter(|a| !a.hosts.is_empty()).map(|a| a.hosts.clone()),
             ..Default::default()
         }),
+        networking_config: net.map(|a| a.config),
         ..Default::default()
     };
     let name = (!r.name.is_empty()).then(|| r.name.clone());
@@ -279,6 +331,20 @@ mod tests {
         assert!(matches!(after_pull(Ok(()), false), Ok(false)));
         assert!(matches!(after_pull(Err(anyhow!("no registry")), true), Ok(true)), "built or loaded here, never pushed");
         assert_eq!(after_pull(Err(anyhow!("pulling x: denied")), false).unwrap_err().to_string(), "pulling x: denied");
+    }
+
+    #[test]
+    fn a_workload_of_a_stack_joins_its_network_at_its_address_with_its_hosts() {
+        assert!(attach(&v1::RunContainer { workload_id: "w".into(), ..Default::default() }).unwrap().is_none(), "no stack, Docker's default network");
+        let r = v1::RunContainer { workload_id: "web.api.1".into(), network_stack: "web".into(), address: "10.240.3.2".into(), hosts: vec!["api:10.240.3.2".into(), "db:10.240.3.3".into()], ..Default::default() };
+        let a = attach(&r).unwrap().unwrap();
+        assert_eq!(a.network_mode, "fd-web");
+        assert_eq!(a.hosts, vec!["api:10.240.3.2".to_string(), "db:10.240.3.3".to_string()]);
+        let ep = &a.config.endpoints_config.as_ref().unwrap()["fd-web"];
+        assert_eq!(ep.ipam_config.as_ref().unwrap().ipv4_address.as_deref(), Some("10.240.3.2"));
+        assert!(attach(&v1::RunContainer { hosts: vec!["bad host:1.2.3.4".into()], ..r.clone() }).is_err());
+        assert!(attach(&v1::RunContainer { network_stack: "../x".into(), ..r.clone() }).is_err());
+        assert!(attach(&v1::RunContainer { address: "10.240.3.1".into(), ..r }).is_err(), "never the gateway");
     }
 
     #[test]

@@ -64,7 +64,9 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     assert!(err.to_string().contains("used"), "{err}");
 
     let exec = Executor::new(node_id.clone(), None, Some(wdir.path().join("commands.json")));
-    let w = Arc::new(Worker { config, files, node_id: node_id.clone(), hostname: "test-host".into(), docker: None, exec, probe: Probe::default(), fence: Arc::new(freightdock_worker::fence::Fence::open(None, "boot".into(), Default::default(), freightdock_worker::fence::RebootPolicy::Never, true)) });
+    let net = freightdock_worker::net::Net::open(wdir.path()).unwrap();
+    let key = net.report().public_key;
+    let w = Arc::new(Worker { config, files, node_id: node_id.clone(), hostname: "test-host".into(), docker: None, exec, probe: Probe::default(), net: Some(net), fence: Arc::new(freightdock_worker::fence::Fence::open(None, "boot".into(), Default::default(), freightdock_worker::fence::RebootPolicy::Never, true)) });
     let run = tokio::spawn({
         let w = w.clone();
         async move { w.run().await }
@@ -73,6 +75,7 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     until("the worker's hello", || m.store.read(|s| s.nodes[&node_id].report.clone())).await;
     assert_eq!(m.sessions.liveness(&node_id).health, Health::Healthy);
     assert_eq!(m.store.read(|s| s.nodes[&node_id].report.as_ref().unwrap().labels.get("region").cloned()), Some("lab".into()));
+    assert_eq!(m.store.read(|s| s.nodes[&node_id].report.as_ref().unwrap().wg_public_key.clone()), key, "the node's WireGuard key, for the others' peers");
 
     let c = CommandRecord { id: "c1".into(), node_id: node_id.clone(), op: Op::Ping, config_version: 0, created_at: now_ms(), deadline: now_ms() + 60_000, status: CommandStatus::Pending, message: String::new(), result_json: String::new(), updated_at: now_ms() };
     m.store.propose(Entry::CommandCreated { command: c.clone() }).await.unwrap();

@@ -2,7 +2,9 @@
 
 The worker-agent of a Freightdock cluster. It enrols with a cluster join token (`FDCT1-...`), keeps one mutual-TLS
 gRPC stream to any of the cluster's managers (and moves to another when that one goes), sends heartbeats, and runs
-the commands it is given against the local Docker. It decides nothing cluster-wide itself.
+the commands it is given against the local Docker. It runs the node's overlay too (Freightdock-Network): a WireGuard
+interface `fd0` to the other nodes, which needs `wg` (wireguard-tools) and `nft` (nftables) on the host. It decides
+nothing cluster-wide itself.
 
 Its contract is the **Freightdock-Contracts** repository (`freightdock-proto`); the managers are the **Freightdock-Manager** repository,
 whose README has the install steps and whose ROADMAP.md and PROGRESS.md have the plan and the log.
@@ -14,6 +16,8 @@ src/session.rs   the stream: hello, heartbeats, commands in, updates out; failov
 src/exec.rs      the command executor, idempotent by command id, its journal on disk
 src/docker.rs    Docker operations, workloads found by the label io.freightdock.workload
 src/host.rs      what it reports of its host: names, boot id, resources, capabilities
+src/net.rs       the overlay (G9): the WireGuard key (wg.key), the managers' network state applied by
+                 Freightdock-Network's agent, a stack's Docker network (fd-<stack>) made when a workload of it runs
 tests/e2e.rs     a real manager in process: enrolment, the session, commands
 deploy/          systemd unit
 ```
@@ -23,7 +27,7 @@ deploy/          systemd unit
 | `FREIGHTDOCK_MANAGERS` | (required) | Manager endpoints, `host[:port]`, comma separated; 7450 when no port is given |
 | `FREIGHTDOCK_JOIN_TOKEN` | | The cluster join token, spent once on a certificate |
 | `FREIGHTDOCK_JOIN_TOKEN_FILE` | | Read the token from this file instead: on a node that runs a manager too, the file it leaves (`FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN`) |
-| `FREIGHTDOCK_WORKER_DATA` | `/var/lib/freightdock-worker` | Node id, key, certificate, cluster CA, managers learned, command journal |
+| `FREIGHTDOCK_WORKER_DATA` | `/var/lib/freightdock-worker` | Node id, key, certificate, cluster CA, managers learned, command journal, the WireGuard key |
 | `FREIGHTDOCK_DOCKER` | `unix:///var/run/docker.sock` | The Docker socket |
 | `FREIGHTDOCK_LABELS` | | Node labels, `key=value,key=value` |
 | `RUST_LOG` | `freightdock_worker=info,warn` | How much it logs |

@@ -32,6 +32,8 @@ pub struct Worker {
     pub probe: Probe,
     /// The self-fencing state and the countdown from the last word of any manager.
     pub fence: Arc<crate::fence::Fence>,
+    /// The overlay (G9); `None` when its key could not be made.
+    pub net: Option<Arc<crate::net::Net>>,
 }
 
 /// What the hello and heartbeats say of the fence.
@@ -95,8 +97,7 @@ impl Worker {
             agent_version: env!("CARGO_PKG_VERSION").into(),
             boot_id: crate::host::boot_id(),
             fencing_state: fencing_state(&self.fence) as i32,
-            // The overlay comes with G9.4.
-            network: None,
+            network: self.net.as_ref().map(|n| n.report()),
             labels: self.config.labels.clone().into_iter().collect(),
             resources: Some(self.probe.resources(running)),
             capabilities: Some(crate::host::capabilities(docker_version)),
@@ -124,7 +125,7 @@ impl Worker {
         self.exec.attach(Some(tx.clone()));
 
         let beats = {
-            let (tx, docker, fence) = (tx.clone(), self.docker.clone(), self.fence.clone());
+            let (tx, docker, fence, net) = (tx.clone(), self.docker.clone(), self.fence.clone(), self.net.clone());
             let probe = Probe::default();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(every);
@@ -142,7 +143,7 @@ impl Worker {
                         Some(d) => crate::docker::workloads(d).await,
                         None => None,
                     };
-                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, network: None, fencing_state: fencing_state(&fence) as i32 };
+                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, network: net.as_ref().map(|n| n.report()), fencing_state: fencing_state(&fence) as i32 };
                     if tx.send(WorkerMessage { body: Some(worker_message::Body::Heartbeat(hb)) }).await.is_err() {
                         break;
                     }
@@ -162,8 +163,12 @@ impl Worker {
                         self.exec.handle(c);
                     }
                     Some(manager_message::Body::HeartbeatAck(_)) => {}
-                    // The node's network: applied from G9.4, ignored until then.
-                    Some(manager_message::Body::Network(_)) => {}
+                    // The node's overlay, whole: applied beside the stream, an older one than applied ignored.
+                    Some(manager_message::Body::Network(n)) => {
+                        if let Some(net) = &self.net {
+                            tokio::spawn(net.clone().apply(n));
+                        }
+                    }
                     Some(manager_message::Body::Authorize(a)) => {
                         if let Some(f) = self.fence.fenced() {
                             tracing::warn!(by = %a.by, "authorized by the managers again (fenced since {}: {})", f.at_ms, f.reason);

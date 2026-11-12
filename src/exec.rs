@@ -30,6 +30,8 @@ pub struct Executor {
     journal: Option<PathBuf>,
     /// While it says fenced, no managed workload is started (plan 7.4).
     fence: std::sync::OnceLock<Arc<crate::fence::Fence>>,
+    /// The overlay, told when a stack's bridge is there (G9).
+    net: std::sync::OnceLock<Arc<crate::net::Net>>,
 }
 
 /// A command's last update, as kept on disk.
@@ -64,7 +66,7 @@ impl Executor {
             tracing::warn!(command = %id, "was running when the worker stopped; reported failed");
             *k = Kept { status: CommandStatus::Failed as i32, message: "the worker restarted while running it".into(), result_json: String::new(), at_ms: now_ms() };
         }
-        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default() };
+        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default(), net: Default::default() };
         e.save(&e.known.lock().expect("known lock"));
         Arc::new(e)
     }
@@ -81,6 +83,11 @@ impl Executor {
     /// The fence that keeps runs from starting while the node is fenced.
     pub fn guard(&self, f: Arc<crate::fence::Fence>) {
         let _ = self.fence.set(f);
+    }
+
+    /// The overlay this worker runs.
+    pub fn with_net(&self, n: Arc<crate::net::Net>) {
+        let _ = self.net.set(n);
     }
 
     /// The stream updates go to from now on; `None` when there is none.
@@ -145,7 +152,16 @@ impl Executor {
         Ok(match op {
             Op::Ping(_) => ("pong".into(), serde_json::json!({ "pong": true, "at_ms": now_ms() })),
             Op::DockerInfo(_) => ("".into(), crate::docker::info(docker()?).await?),
-            Op::RunContainer(r) => ("running".into(), crate::docker::run(docker()?, &r).await?),
+            Op::RunContainer(r) => {
+                let v = crate::docker::run(docker()?, &r).await?;
+                if let (Some(n), false) = (self.net.get(), r.network_stack.is_empty()) {
+                    // Without it the stack's workloads on other nodes are not reached from here: said, not fatal.
+                    if let Err(e) = n.clone().bridge_ready(r.network_stack.clone()).await {
+                        tracing::warn!(stack = %r.network_stack, "proxy ARP on the stack's bridge: {e:#}");
+                    }
+                }
+                ("running".into(), v)
+            }
             Op::StopContainer(s) => ("stopped".into(), crate::docker::stop(docker()?, &s).await?),
             Op::RemoveContainer(r) => ("removed".into(), crate::docker::remove(docker()?, &r).await?),
         })
