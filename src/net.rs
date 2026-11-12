@@ -133,6 +133,14 @@ impl Net {
         }
     }
 
+    /// Takes the floating addresses off the node (it fenced itself; the managers move them once it is fenced).
+    pub async fn drop_floating(self: Arc<Self>) {
+        let r = tokio::task::spawn_blocking(move || self.agent.lock().expect("net agent").drop_floating()).await;
+        if let Ok(Err(e)) | Err(e) = r.map_err(anyhow::Error::from) {
+            tracing::error!("fence: the floating addresses could not be taken off: {e:#}");
+        }
+    }
+
     /// Proxy ARP on a stack's bridge, once Docker made it.
     pub async fn bridge_ready(self: Arc<Self>, stack: String) -> Result<()> {
         tokio::task::spawn_blocking(move || self.agent.lock().expect("net agent").proxy_arp(&bridge_name(&stack))).await?

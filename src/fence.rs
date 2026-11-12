@@ -205,9 +205,9 @@ impl Fence {
 
 /// The countdown, once a second until the process ends: past `stop` it fences and stops every managed container
 /// (again each second while one still runs), past `stop + storage + reboot` it reboots once if the policy says so.
-/// Each round also tells systemd's watchdog the worker is alive: a worker frozen anywhere stops saying so, and its
+/// Fenced, it holds no floating address either (G10.3), taken off before the workloads stop. Each round also tells systemd's watchdog the worker is alive: a worker frozen anywhere stops saying so, and its
 /// unit restarts it (and reboots the node if it will not come back), so a frozen worker still fences.
-pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>) {
+pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, net: Option<std::sync::Arc<crate::net::Net>>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut rebooting = false;
@@ -225,6 +225,9 @@ pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>) {
         if f.fenced().is_none() {
             tracing::warn!("no manager heard from for {}s: fencing (stopping every managed workload)", silent.as_secs());
             f.enter(&format!("no manager heard from for {}s", silent.as_secs()));
+        }
+        if let Some(n) = &net {
+            n.clone().drop_floating().await;
         }
         let running = match &docker {
             Some(d) => crate::docker::stop_all(d).await.unwrap_or_else(|e| {
