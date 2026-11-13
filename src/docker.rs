@@ -78,17 +78,29 @@ pub async fn workloads(d: &Docker) -> Option<v1::WorkloadReport> {
         .into_iter()
         .filter_map(|c| {
             let workload_id = c.labels.as_ref()?.get(LABEL_WORKLOAD)?.clone();
+            let addresses = addresses_of(&c);
             Some(v1::WorkloadState {
                 workload_id,
                 generation: generation_of(c.labels.as_ref()),
                 container_id: c.id.unwrap_or_default(),
                 state: c.state.map(|s| s.to_string()).unwrap_or_default(),
                 exit_code: exit_code(c.status.as_deref().unwrap_or("")),
+                addresses,
                 image: c.image.unwrap_or_default(),
             })
         })
         .collect();
     Some(v1::WorkloadReport { workloads })
+}
+
+/// A running container's IPv4 addresses on its networks, sorted; none for one not running.
+fn addresses_of(c: &bollard::models::ContainerSummary) -> Vec<String> {
+    if c.state != Some(bollard::models::ContainerSummaryStateEnum::RUNNING) {
+        return vec![];
+    }
+    let mut v: Vec<String> = c.network_settings.as_ref().and_then(|n| n.networks.as_ref()).into_iter().flat_map(|n| n.values()).filter_map(|e| e.ip_address.clone()).filter(|a| !a.is_empty()).collect();
+    v.sort();
+    v
 }
 
 /// The code in Docker's status line, "Exited (137) 5 minutes ago"; 0 for any other line.
@@ -335,6 +347,19 @@ pub async fn stack_pids(d: &Docker, stack: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_container_s_addresses_are_those_of_its_networks() {
+        use bollard::models::{ContainerSummary, ContainerSummaryNetworkSettings, ContainerSummaryStateEnum, EndpointSettings};
+        let on = |ip: &str| EndpointSettings { ip_address: Some(ip.into()), ..Default::default() };
+        let c = ContainerSummary {
+            state: Some(ContainerSummaryStateEnum::RUNNING),
+            network_settings: Some(ContainerSummaryNetworkSettings { networks: Some(HashMap::from([("fd-app".into(), on("10.240.1.5")), ("bridge".into(), on("172.17.0.3")), ("none".into(), on(""))])) }),
+            ..Default::default()
+        };
+        assert_eq!(addresses_of(&c), vec!["10.240.1.5", "172.17.0.3"]);
+        assert!(addresses_of(&ContainerSummary { state: Some(ContainerSummaryStateEnum::EXITED), ..c }).is_empty(), "only while it runs");
+    }
 
     #[test]
     fn tags_split_at_the_last_colon_of_the_last_part() {
