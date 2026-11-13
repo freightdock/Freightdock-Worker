@@ -13,6 +13,7 @@ bollard = "0.19"
 freightdock-network = { path = "../Freightdock-Network" }
 freightdock-proto = { path = "../Freightdock-Contracts" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+libc = "0.2"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 rand = "0.10"
 rcgen = "0.14"

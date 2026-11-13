@@ -143,6 +143,7 @@ impl Worker {
 
         let beats = {
             let (tx, docker, fence, net, paced) = (tx.clone(), self.docker.clone(), self.fence.clone(), self.net.clone(), paced.clone());
+            let health = self.exec.storage_health();
             let probe = Probe::default();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(every);
@@ -171,7 +172,11 @@ impl Worker {
                         Some(n) => n.clone().traffic().await,
                         None => None,
                     };
-                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, network: net.as_ref().map(|n| n.report()), fencing_state: fencing_state(&fence) as i32, traffic };
+                    let storage = health.as_ref().and_then(|h| {
+                        h.tick();
+                        h.report()
+                    });
+                    let hb = v1::Heartbeat { seq, sent_at_ms, resources: Some(probe.resources(running)), workloads, network: net.as_ref().map(|n| n.report()), fencing_state: fencing_state(&fence) as i32, traffic, storage };
                     if tx.send(WorkerMessage { body: Some(worker_message::Body::Heartbeat(hb)) }).await.is_err() {
                         break;
                     }

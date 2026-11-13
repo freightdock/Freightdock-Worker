@@ -140,6 +140,161 @@ pub fn ready(base: &Path, r: &v1::RunContainer, run: &mut impl Run) -> Result<Ve
     Ok(bind(&r.volumes, &dirs))
 }
 
+/// How long a probe may take before the storage is said not to answer (an NFS server gone hangs it, maybe for good).
+pub const HANG: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often each storage is probed.
+pub const EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// Free and total bytes of the filesystem `p` is on.
+fn space(p: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a statvfs the call fills.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        bail!("{}: {}", p.display(), std::io::Error::last_os_error());
+    }
+    let frsize = st.f_frsize as u64;
+    Ok((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
+}
+
+/// One storage probed now: an NFS export mounted at its root (else a write would land on the node's own disk), its
+/// space, and a small file of this node's written, synced, read back and removed. Blocks: an export gone may hang it.
+pub fn probe(name: &str, driver: &str, root: &Path, node_id: &str, mounted: &[PathBuf]) -> v1::StorageHealth {
+    let started = std::time::Instant::now();
+    let mut h = v1::StorageHealth { name: name.into(), driver: driver.into(), at_ms: unix_ms(), ..Default::default() };
+    let r: Result<()> = (|| {
+        if driver == "nfs" && !mounted.iter().any(|m| m == root) {
+            bail!("{} is not mounted at {}", name, root.display());
+        }
+        if !root.is_dir() {
+            bail!("{} is not on this node", root.display());
+        }
+        (h.total_bytes, h.free_bytes) = space(root)?;
+        let file = root.join(format!(".freightdock-probe-{node_id}"));
+        let said = format!("{node_id} {}", h.at_ms);
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&file).with_context(|| format!("writing {}", file.display()))?;
+            f.write_all(said.as_bytes()).and_then(|_| f.sync_all()).with_context(|| format!("writing {}", file.display()))?;
+        }
+        let back = std::fs::read_to_string(&file).with_context(|| format!("reading {} back", file.display()))?;
+        std::fs::remove_file(&file).with_context(|| format!("removing {}", file.display()))?;
+        if back != said {
+            bail!("{} read back other than written", file.display());
+        }
+        Ok(())
+    })();
+    h.probe_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    match r {
+        Ok(()) => h.ok = true,
+        Err(e) => h.error = format!("{e:#}"),
+    }
+    h
+}
+
+/// A storage this node made ready, and how it last answered.
+#[derive(Clone)]
+struct Known {
+    driver: String,
+    root: PathBuf,
+    last: Option<v1::StorageHealth>,
+    /// Since when a probe has been running, if one is.
+    probing: Option<std::time::Instant>,
+}
+
+/// The health of the shared storage this node made ready (G11.8): each probed on a thread of its own every `EVERY`,
+/// never two at once (a probe stuck on an export gone stays stuck; it is said, not piled on), the latest answer kept
+/// for the heartbeat. What it knows is kept in a file, so a restarted worker goes on probing.
+pub struct Health {
+    node_id: String,
+    file: Option<PathBuf>,
+    known: std::sync::Mutex<BTreeMap<String, Known>>,
+    last_round: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Health {
+    pub fn new(node_id: String, file: Option<PathBuf>) -> std::sync::Arc<Self> {
+        let saved: BTreeMap<String, (String, PathBuf)> = file.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let known = saved.into_iter().map(|(n, (driver, root))| (n, Known { driver, root, last: None, probing: None })).collect();
+        std::sync::Arc::new(Health { node_id, file, known: std::sync::Mutex::new(known), last_round: Default::default() })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Known>> {
+        self.known.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A storage made ready here, to probe from now on.
+    pub fn remember(&self, name: &str, driver: &str, root: &Path) {
+        let mut k = self.lock();
+        if k.get(name).is_some_and(|x| x.driver == driver && x.root == root) {
+            return;
+        }
+        k.insert(name.into(), Known { driver: driver.into(), root: root.into(), last: None, probing: None });
+        if let Some(f) = &self.file {
+            let saved: BTreeMap<&String, (&String, &PathBuf)> = k.iter().map(|(n, x)| (n, (&x.driver, &x.root))).collect();
+            if let Err(e) = serde_json::to_vec(&saved).map_err(std::io::Error::other).and_then(|b| std::fs::write(f, b)) {
+                tracing::warn!("keeping the storage list in {}: {e}", f.display());
+            }
+        }
+    }
+
+    /// Starts a probe of each storage not being probed, if the last round is `EVERY` ago.
+    pub fn tick(self: &std::sync::Arc<Self>) {
+        {
+            let mut last = self.last_round.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|l| l.elapsed() < EVERY) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let mounted = mount_points(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
+        let mut k = self.lock();
+        for (name, x) in k.iter_mut().filter(|(_, x)| x.probing.is_none()) {
+            x.probing = Some(std::time::Instant::now());
+            let (me, name, driver, root, mounted) = (self.clone(), name.clone(), x.driver.clone(), x.root.clone(), mounted.clone());
+            let spawned = std::thread::Builder::new().name("storage-probe".into()).spawn(move || {
+                let h = probe(&name, &driver, &root, &me.node_id, &mounted);
+                if let Some(x) = me.lock().get_mut(&name) {
+                    x.last = Some(h);
+                    x.probing = None;
+                }
+            });
+            if let Err(e) = spawned {
+                x.probing = None;
+                tracing::warn!("probing storage: {e}");
+            }
+        }
+    }
+
+    /// What to say in the heartbeat: each storage's last answer, or that its probe has hung. None when it knows none.
+    pub fn report(&self) -> Option<v1::StorageReport> {
+        let k = self.lock();
+        if k.is_empty() {
+            return None;
+        }
+        let storages = k
+            .iter()
+            .filter_map(|(name, x)| match x.probing {
+                Some(since) if since.elapsed() >= HANG => Some(v1::StorageHealth {
+                    name: name.clone(),
+                    driver: x.driver.clone(),
+                    ok: false,
+                    error: format!("the storage has not answered for {} s", since.elapsed().as_secs()),
+                    at_ms: unix_ms(),
+                    ..x.last.clone().unwrap_or_default()
+                }),
+                _ => x.last.clone(),
+            })
+            .collect();
+        Some(v1::StorageReport { storages })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +380,58 @@ mod tests {
         let mut f = Fake::default();
         assert_eq!(unmount_all(Path::new("/var/lib/freightdock-worker/storage"), &m, &mut &mut f), 2);
         assert_eq!(f.calls, vec!["umount -f -l /var/lib/freightdock-worker/storage/nas", "umount -f -l /var/lib/freightdock-worker/storage/my nas"]);
+    }
+
+    #[test]
+    fn a_path_storage_answers_with_its_space_and_leaves_nothing_behind() {
+        let d = tempfile::tempdir().unwrap();
+        let h = probe("share", "path", d.path(), "n1", &[]);
+        assert!(h.ok, "{}", h.error);
+        assert!(h.total_bytes > 0 && h.free_bytes <= h.total_bytes);
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0, "the probe file is removed");
+        let gone = probe("share", "path", Path::new("/nowhere/at/all"), "n1", &[]);
+        assert!(!gone.ok && gone.error.contains("not on this node"), "{}", gone.error);
+    }
+
+    #[test]
+    fn an_nfs_storage_not_mounted_is_unhealthy_though_its_directory_is_there() {
+        let d = tempfile::tempdir().unwrap();
+        let h = probe("nas", "nfs", d.path(), "n1", &[]);
+        assert!(!h.ok && h.error.contains("not mounted"), "a write there lands on the node's own disk: {}", h.error);
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0, "and nothing is written");
+        assert!(probe("nas", "nfs", d.path(), "n1", &[d.path().to_path_buf()]).ok);
+    }
+
+    #[test]
+    fn the_storage_made_ready_is_probed_reported_and_remembered_over_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("storage.json");
+        let h = Health::new("n1".into(), Some(file.clone()));
+        assert!(h.report().is_none(), "nothing known, nothing said");
+        h.remember("share", "path", d.path());
+        h.tick();
+        let mut said = None;
+        for _ in 0..200 {
+            said = h.report().and_then(|r| r.storages.into_iter().next());
+            if said.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let said = said.expect("probed");
+        assert!(said.ok && said.name == "share", "{said:?}");
+        let again = Health::new("n1".into(), Some(file));
+        assert_eq!(again.lock().keys().cloned().collect::<Vec<_>>(), ["share"]);
+    }
+
+    #[test]
+    fn a_probe_that_hangs_is_said_and_not_piled_on() {
+        let h = Health::new("n1".into(), None);
+        h.remember("nas", "nfs", Path::new("/nowhere"));
+        h.lock().get_mut("nas").unwrap().probing = Some(std::time::Instant::now() - HANG);
+        let r = h.report().unwrap();
+        assert!(!r.storages[0].ok && r.storages[0].error.contains("not answered"), "{:?}", r.storages[0]);
+        h.tick();
+        assert!(h.lock()["nas"].probing.unwrap().elapsed() >= HANG, "no second probe beside the stuck one");
     }
 }
