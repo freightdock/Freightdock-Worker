@@ -41,6 +41,11 @@ pub fn fencing_state(f: &crate::fence::Fence) -> FencingState {
     if f.fenced().is_some() { FencingState::AwaitingAuthorization } else { FencingState::None }
 }
 
+/// The heartbeat's interval a manager asks for, kept from half a second to thirty.
+pub fn pace(ms: u32) -> Duration {
+    Duration::from_millis(ms.clamp(500, 30_000) as u64)
+}
+
 /// The wait after `failed_rounds` rounds in which no manager would talk.
 pub fn backoff(failed_rounds: u32, jitter: f64) -> Duration {
     let base = Duration::from_secs(1).saturating_mul(1 << failed_rounds.min(5)).min(MAX_WAIT);
@@ -120,7 +125,9 @@ impl Worker {
         self.fence.heard();
         self.files.keep_managers(&welcome.managers);
         self.fence.set_timers(self.fence.timers().with_welcome(welcome.fence_stop_s, welcome.fence_storage_s, welcome.fence_reboot_s));
-        let every = Duration::from_millis(welcome.heartbeat_interval_ms.clamp(500, 30_000) as u64);
+        let every = pace(welcome.heartbeat_interval_ms);
+        // The pace a later Welcome may change (the cluster's settings), read by the heartbeats.
+        let paced = Arc::new(std::sync::atomic::AtomicU64::new(every.as_millis() as u64));
         tracing::info!(manager = %welcome.manager_id, cluster = %welcome.cluster_id, "connected to {addr}; heartbeat every {}ms", every.as_millis());
         self.exec.attach(Some(tx.clone()));
         if welcome.renew_certificate {
@@ -135,14 +142,21 @@ impl Worker {
         }
 
         let beats = {
-            let (tx, docker, fence, net) = (tx.clone(), self.docker.clone(), self.fence.clone(), self.net.clone());
+            let (tx, docker, fence, net, paced) = (tx.clone(), self.docker.clone(), self.fence.clone(), self.net.clone(), paced.clone());
             let probe = Probe::default();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(every);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut seq = 0u64;
+                let mut every = every;
                 loop {
                     tick.tick().await;
+                    let now = Duration::from_millis(paced.load(std::sync::atomic::Ordering::Relaxed));
+                    if now != every {
+                        every = now;
+                        tick = tokio::time::interval(every);
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    }
                     seq += 1;
                     let running = match &docker {
                         Some(d) => crate::docker::running(d).await,
@@ -189,7 +203,16 @@ impl Worker {
                             self.fence.clear();
                         }
                     }
-                    Some(manager_message::Body::Welcome(w)) => self.files.keep_managers(&w.managers),
+                    // Again on a stream: the cluster's settings changed. The new timers and pace from now on.
+                    Some(manager_message::Body::Welcome(w)) => {
+                        self.files.keep_managers(&w.managers);
+                        let timers = self.fence.timers().with_welcome(w.fence_stop_s, w.fence_storage_s, w.fence_reboot_s);
+                        if timers != self.fence.timers() {
+                            tracing::info!(?timers, "the cluster's fencing timers changed");
+                        }
+                        self.fence.set_timers(timers);
+                        paced.store(pace(w.heartbeat_interval_ms).as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     None => {}
                 },
                 Ok(Ok(None)) => break Ok(()),
@@ -206,6 +229,13 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_heartbeat_s_pace_is_the_manager_s_within_limits() {
+        assert_eq!(pace(2000), Duration::from_secs(2));
+        assert_eq!(pace(0), Duration::from_millis(500));
+        assert_eq!(pace(999_999), Duration::from_secs(30));
+    }
 
     #[test]
     fn the_wait_doubles_to_thirty_seconds() {
