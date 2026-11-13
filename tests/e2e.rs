@@ -83,6 +83,13 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     until("the ping's end", || m.store.read(|s| (s.commands["c1"].status == CommandStatus::Succeeded).then_some(()))).await;
     assert!(m.store.read(|s| s.commands["c1"].result_json.contains("pong")));
 
+    // The node's Docker pages: a request on the stream, the reply by its id (this worker has no Docker to ask).
+    assert!(m.store.read(|s| s.nodes[&node_id].report.as_ref().unwrap().docker_requests), "the worker says it answers");
+    let e = m.docker(&node_id, "containers", "", Default::default()).await.unwrap_err();
+    assert_eq!(e.to_string(), "this worker has no Docker");
+    let e = m.docker(&node_id, "exec", "x", Default::default()).await.unwrap_err();
+    assert!(e.to_string().contains("not something"), "{e}");
+
     // G2.7: a new certificate, asked with the current one; the worker comes back with it, and the old one still opens.
     let before = m.store.read(|s| s.nodes[&node_id].cert_sha256.clone());
     let ch = freightdock_worker::tls::channel(&format!("127.0.0.1:{port}"), freightdock_worker::tls::mutual(&w.files).unwrap()).await.unwrap();

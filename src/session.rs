@@ -191,6 +191,14 @@ impl Worker {
                         self.exec.handle(c);
                     }
                     Some(manager_message::Body::HeartbeatAck(_)) => {}
+                    // A person's look at, or change to, this node's Docker: answered beside the stream.
+                    Some(manager_message::Body::Docker(r)) => {
+                        let (docker, tx) = (self.docker.clone(), tx.clone());
+                        tokio::spawn(async move {
+                            let reply = crate::pages::answer(docker.as_ref(), &r).await;
+                            let _ = tx.send(WorkerMessage { body: Some(worker_message::Body::DockerReply(reply)) }).await;
+                        });
+                    }
                     // The node's overlay, whole: applied beside the stream, an older one than applied ignored.
                     Some(manager_message::Body::Network(n)) => {
                         if let Some(net) = &self.net {

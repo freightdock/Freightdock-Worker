@@ -53,5 +53,6 @@ pub fn capabilities(docker_version: Option<String>) -> Capabilities {
         os: sysinfo::System::long_os_version().unwrap_or_default(),
         arch: std::env::consts::ARCH.to_string(),
         kernel: sysinfo::System::kernel_version().unwrap_or_default(),
+        docker_requests: true,
     }
 }

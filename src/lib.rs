@@ -11,6 +11,7 @@ pub mod exec;
 pub mod fence;
 pub mod host;
 pub mod net;
+pub mod pages;
 pub mod session;
 pub mod storage;
 pub mod tls;

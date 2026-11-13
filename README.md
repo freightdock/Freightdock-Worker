@@ -7,7 +7,7 @@ interface `fd0` to the other nodes, which needs `wg` (wireguard-tools) and `nft`
 nothing cluster-wide itself.
 
 Its contract is the **Freightdock-Contracts** repository (`freightdock-proto`); the managers are the **Freightdock-Manager** repository,
-whose README has the install steps and whose ROADMAP.md and PROGRESS.md have the plan and the log.
+whose README has the install steps and whose ROADMAP.md has the plan.
 
 ```
 src/lib.rs       settings, the files in the data folder, the order managers are dialled in
@@ -15,6 +15,8 @@ src/enrol.rs     the join token spent on a client certificate (the manager check
 src/session.rs   the stream: hello, heartbeats, commands in, updates out; failover and backoff over the managers
 src/exec.rs      the command executor, idempotent by command id, its journal on disk
 src/docker.rs    Docker operations, workloads found by the label io.freightdock.workload
+src/pages.rs     the node's Docker for a person (the UI's per-node pages): DockerRequest answered beside the
+                 stream, never journalled; the cluster's own containers, networks and volumes never changed this way
 src/host.rs      what it reports of its host: names, boot id, resources, capabilities
 src/net.rs       the overlay (G9): the WireGuard key (wg.key), the managers' network state applied by
                  Freightdock-Network's agent, a stack's Docker network (fd-<stack>) made when a workload of it runs
