@@ -56,6 +56,8 @@ struct Found {
     id: String,
     up: bool,
     generation: u64,
+    /// Its addresses while it runs (`addresses_of`).
+    addresses: Vec<String>,
 }
 
 fn generation_of(labels: Option<&HashMap<String, String>>) -> u64 {
@@ -66,7 +68,7 @@ fn generation_of(labels: Option<&HashMap<String, String>>) -> u64 {
 async fn find(d: &Docker, workload: &str) -> Result<Option<Found>> {
     let f = HashMap::from([("label".to_string(), vec![format!("{LABEL_WORKLOAD}={workload}")])]);
     let l = d.list_containers(Some(q::ListContainersOptions { all: true, filters: Some(f), ..Default::default() })).await?;
-    Ok(l.into_iter().next().map(|c| Found { generation: generation_of(c.labels.as_ref()), up: c.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING), id: c.id.unwrap_or_default() }))
+    Ok(l.into_iter().next().map(|c| Found { generation: generation_of(c.labels.as_ref()), up: c.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING), addresses: addresses_of(&c), id: c.id.unwrap_or_default() }))
 }
 
 /// Every managed container here, for the heartbeat; `None` when Docker does not answer (the manager then acts on
@@ -101,6 +103,12 @@ fn addresses_of(c: &bollard::models::ContainerSummary) -> Vec<String> {
     let mut v: Vec<String> = c.network_settings.as_ref().and_then(|n| n.networks.as_ref()).into_iter().flat_map(|n| n.values()).filter_map(|e| e.ip_address.clone()).filter(|a| !a.is_empty()).collect();
     v.sort();
     v
+}
+
+/// Whether the container there is the run's: made for its generation and, running, on its overlay address. One made
+/// before the node knew the overlay is not, and is made again.
+fn kept(f: &Found, r: &v1::RunContainer) -> bool {
+    f.generation == r.generation && (r.network_stack.is_empty() || !f.up || f.addresses.contains(&r.address))
 }
 
 /// The code in Docker's status line, "Exited (137) 5 minutes ago"; 0 for any other line.
@@ -224,7 +232,7 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
     let (exposed, bound) = published(r)?;
     let net = attach(r)?;
     if let Some(f) = find(d, &r.workload_id).await? {
-        if f.generation == r.generation {
+        if kept(&f, r) {
             if !f.up {
                 d.start_container(&f.id, None::<q::StartContainerOptions>).await.context("starting the workload's container")?;
             }
@@ -347,6 +355,17 @@ pub async fn stack_pids(d: &Docker, stack: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_container_of_the_generation_is_kept_unless_it_runs_off_its_overlay_address() {
+        let r = v1::RunContainer { generation: 3, network_stack: "app".into(), address: "10.240.1.5".into(), ..Default::default() };
+        let f = |generation: u64, up: bool, at: &str| Found { id: "c".into(), up, generation, addresses: vec![at.to_string()] };
+        assert!(kept(&f(3, true, "10.240.1.5"), &r));
+        assert!(!kept(&f(2, true, "10.240.1.5"), &r), "another generation");
+        assert!(!kept(&f(3, true, "172.17.0.3"), &r), "made before the overlay");
+        assert!(kept(&f(3, false, ""), &r), "stopped: started, and seen once it runs");
+        assert!(kept(&f(3, true, "172.17.0.3"), &v1::RunContainer { network_stack: String::new(), ..r }), "off the overlay by design");
+    }
 
     #[test]
     fn a_running_container_s_addresses_are_those_of_its_networks() {
