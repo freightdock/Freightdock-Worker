@@ -1,0 +1,83 @@
+# gitleaks configuration: what must never be committed here.
+#
+# Run by CI on every push and pull request (.github/workflows/ci.yml, the `secrets` job). gitleaks' own rules apply, plus Freightdock's below.
+#
+# An allowlist entry is for a genuine test fixture or third-party file only, and says why. Never allowlist a real
+# secret: take it out, and rotate it.
+
+title = "Freightdock"
+
+[extend]
+useDefault = true
+
+# Freightdock's own credentials.
+
+[[rules]]
+id = "freightdock-api-token"
+description = "A Freightdock API token (fdk_ and 64 hex digits), which signs in as its owner"
+regex = '''\bfdk_[0-9a-f]{64}\b'''
+keywords = ["fdk_"]
+
+[[rules]]
+id = "freightdock-join-token"
+description = "A Freightdock agent join token (FDJT1-<CA fingerprint>-<secret>), good once for 24 hours"
+regex = '''\bFDJT1-[0-9a-f]{64}-[0-9a-f]{64}\b'''
+keywords = ["fdjt1-"]
+
+[[rules]]
+id = "freightdock-webhook-url"
+description = "A Freightdock webhook address with its token, which redeploys without signing in"
+regex = '''/api/webhooks/[0-9a-f]{64}\b'''
+keywords = ["/api/webhooks/"]
+
+# Private networks. Examples in code and docs use the documentation ranges instead: 192.0.2.0/24, 198.51.100.0/24 and
+# 203.0.113.0/24 (RFC 5737), and example.com names (RFC 2606). Docker's own default pools (172.17.0.0/16 and up) are
+# left out on purpose: describing Docker's networks names them, and they say nothing about anybody's network.
+
+[[rules]]
+id = "private-ipv4-192-168"
+description = "A 192.168.x.x address (RFC 1918): somebody's own network; use 192.0.2.x in examples"
+regex = '''\b192\.168\.\d{1,3}\.\d{1,3}\b'''
+keywords = ["192.168."]
+
+[[rules]]
+id = "private-ipv4-10"
+description = "A 10.x.x.x address (RFC 1918): somebody's own network; use 192.0.2.x in examples"
+regex = '''\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'''
+keywords = ["10."]
+  [[rules.allowlists]]
+  description = "Version numbers and the like that look like an address (10.0.0.0 is no host)"
+  regexes = ['''^10\.0\.0\.0$''']
+  [[rules.allowlists]]
+  description = "The cluster's own default range, 10.240.0.0/16, and addresses in it: Freightdock's design, nobody's network"
+  regexes = ['''^10\.240\.\d{1,3}\.\d{1,3}$''']
+
+# The owner's own domain. It is public already (the commits' author address), but none of its hosts belong in the
+# code or the docs. Names that are not public at all go in the untracked .git/info/private-patterns instead
+# which CI reads, so this file never has to name them.
+
+[[rules]]
+id = "owner-domain"
+description = "A host on the maintainer's own domain; use example.com in examples"
+regex = '''(?i)\b(?:[a-z0-9-]+\.)*olayzen\.(?:com|no)\b'''
+keywords = ["olayzen"]
+
+[allowlist]
+description = "Third-party files and test fixtures that look like secrets but are not"
+paths = [
+  # Vendored, minified third-party code (xterm.js, CodeMirror): unchanged upstream files, e.g. xterm's
+  # "FourKeyMap=" reads as an API key to the generic rule.
+  '''(?:^|/)web/assets/vendor/''',
+  # FinUI, copied source we own upstream: its demos use example addresses; change them in FinUI first.
+  '''(?:^|/)web/assets/finui/''',
+  '''(?:^|/)Cargo\.lock$''',
+]
+regexes = [
+  # RFC 6455's sample Sec-WebSocket-Key, used by the WebSocket tests.
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+  # AWS's published example keys, used by the Signature Version 4 tests (backup/s3.rs, registries/ecr.rs).
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+  # The cipher's name in prose ("key, XChaCha20-Poly1305"), which the generic rule takes for a key.
+  '''XChaCha20-Poly1305''',
+]

@@ -1,0 +1,77 @@
+# Tests Freightdock-Worker: gitleaks on the tree, then tests and clippy (warnings as errors).
+# It depends on Freightdock-Contracts, Freightdock-Network, Freightdock-Manager by path (`../`), so each is checked out beside it, from
+# the same owner's main branch.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.28.0
+
+jobs:
+  secrets:
+    name: Secrets and private data
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: gitleaks on the tree
+        run: |
+          set -eu
+          id=$(docker create "$GITLEAKS_IMAGE" dir /repo -c /repo/.gitleaks.toml --no-banner --redact)
+          trap 'docker rm -f "$id" >/dev/null' EXIT
+          docker cp . "$id:/repo"
+          docker start -a "$id"
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: Freightdock-Worker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/Freightdock-Contracts
+          path: Freightdock-Contracts
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/Freightdock-Network
+          path: Freightdock-Network
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/Freightdock-Manager
+          path: Freightdock-Manager
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            Freightdock-Worker/target
+          key: cargo-worker-${{ runner.os }}-${{ hashFiles('Freightdock-Worker/Cargo.lock') }}
+          restore-keys: cargo-worker-${{ runner.os }}-
+      - name: Tests
+        working-directory: Freightdock-Worker
+        run: cargo test --locked
+      - name: Clippy, warnings as errors
+        working-directory: Freightdock-Worker
+        run: cargo clippy --all-targets --locked -- -D warnings

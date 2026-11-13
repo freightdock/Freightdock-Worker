@@ -204,8 +204,8 @@ mod tests {
 
     #[test]
     fn the_config_reads_the_environment() {
-        let c = Config::from(env(&[("FREIGHTDOCK_MANAGERS", "10.0.0.1, 10.0.0.2:9000,"), ("FREIGHTDOCK_LABELS", "region=north,gpu=true")])).unwrap();
-        assert_eq!(c.managers, vec!["10.0.0.1:7450", "10.0.0.2:9000"]);
+        let c = Config::from(env(&[("FREIGHTDOCK_MANAGERS", "192.0.2.1, 192.0.2.2:9000,"), ("FREIGHTDOCK_LABELS", "region=north,gpu=true")])).unwrap();
+        assert_eq!(c.managers, vec!["192.0.2.1:7450", "192.0.2.2:9000"]);
         assert_eq!(c.labels.get("gpu").map(String::as_str), Some("true"));
         assert_eq!(c.docker, PathBuf::from("/var/run/docker.sock"));
         assert!(Config::from(env(&[("FREIGHTDOCK_JOIN_TOKEN", "FDJT1-abc")])).is_err(), "the single-host agent's token is not this one");
