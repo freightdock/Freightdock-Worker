@@ -204,9 +204,19 @@ pub async fn ensure_network(d: &Docker, stack: &str, address: &str) -> Result<bo
     }
 }
 
-async fn pull(d: &Docker, image: &str) -> Result<()> {
+/// A registry login as Docker takes it with a pull; none for an empty one. Docker Hub's server is its v1 index, as
+/// `docker login` names it.
+pub fn credentials(auth: Option<&v1::RegistryAuth>) -> Option<bollard::auth::DockerCredentials> {
+    let a = auth.filter(|a| !a.username.is_empty())?;
+    let server = if a.server == "docker.io" { "https://index.docker.io/v1/".to_string() } else { a.server.clone() };
+    Some(bollard::auth::DockerCredentials { username: Some(a.username.clone()), password: Some(a.password.clone()), serveraddress: Some(server), ..Default::default() })
+}
+
+/// Pulls the image, with the registry's login when the managers sent one.
+pub async fn pull(d: &Docker, image: &str, auth: Option<&v1::RegistryAuth>) -> Result<()> {
     let (from_image, tag) = split_tag(image);
-    let mut pull = d.create_image(Some(q::CreateImageOptions { from_image: Some(from_image.to_string()), tag: Some(tag.to_string()), ..Default::default() }), None, None);
+    let tag = (!tag.is_empty()).then(|| tag.to_string());
+    let mut pull = d.create_image(Some(q::CreateImageOptions { from_image: Some(from_image.to_string()), tag, ..Default::default() }), None, credentials(auth));
     while let Some(step) = pull.next().await {
         let step = step.with_context(|| format!("pulling {image}"))?;
         if let Some(e) = step.error_detail.and_then(|e| e.message) {
@@ -241,7 +251,7 @@ pub async fn run(d: &Docker, r: &v1::RunContainer) -> Result<Value> {
         // Made for another spec: made again.
         d.remove_container(&f.id, Some(q::RemoveContainerOptions { force: true, ..Default::default() })).await.context("removing the container of the old spec")?;
     }
-    let pulled = pull(d, &r.image).await;
+    let pulled = pull(d, &r.image, r.auth.as_ref()).await;
     let here = pulled.is_err() && d.inspect_image(&r.image).await.is_ok();
     if after_pull(pulled, here)? {
         tracing::warn!(image = %r.image, "could not pull it; running the image already on this node");
@@ -355,6 +365,16 @@ pub async fn stack_pids(d: &Docker, stack: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_login_goes_with_the_pull_as_docker_takes_it() {
+        let a = |server: &str, user: &str| v1::RegistryAuth { server: server.into(), username: user.into(), password: "p".into() };
+        let c = credentials(Some(&a("ghcr.io", "bot"))).unwrap();
+        assert_eq!((c.username.as_deref(), c.password.as_deref(), c.serveraddress.as_deref()), (Some("bot"), Some("p"), Some("ghcr.io")));
+        assert_eq!(credentials(Some(&a("docker.io", "bot"))).unwrap().serveraddress.as_deref(), Some("https://index.docker.io/v1/"));
+        assert!(credentials(Some(&a("ghcr.io", ""))).is_none());
+        assert!(credentials(None).is_none());
+    }
 
     #[test]
     fn a_container_of_the_generation_is_kept_unless_it_runs_off_its_overlay_address() {

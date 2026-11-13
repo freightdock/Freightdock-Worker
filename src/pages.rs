@@ -228,11 +228,7 @@ async fn run(d: &Docker, r: &DockerRequest) -> Result<Value> {
             if !valid(Kind::Image, image) {
                 bail!("{image:?} is not an image name");
             }
-            let (repo, tag) = crate::docker::split_tag(image);
-            let mut s = d.create_image(Some(q::CreateImageOptions { from_image: Some(repo.to_string()), tag: (!tag.is_empty()).then(|| tag.to_string()), ..Default::default() }), None, None);
-            while let Some(p) = s.next().await {
-                p?;
-            }
+            crate::docker::pull(d, image, r.auth.as_ref()).await?;
             json!({ "image": image })
         }
         PruneImages => {
