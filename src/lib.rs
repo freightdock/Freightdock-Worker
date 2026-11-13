@@ -12,6 +12,7 @@ pub mod fence;
 pub mod host;
 pub mod net;
 pub mod session;
+pub mod storage;
 pub mod tls;
 
 use std::collections::BTreeMap;

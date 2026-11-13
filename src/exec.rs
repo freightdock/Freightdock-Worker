@@ -32,6 +32,8 @@ pub struct Executor {
     fence: std::sync::OnceLock<Arc<crate::fence::Fence>>,
     /// The overlay, told when a stack's bridge is there (G9).
     net: std::sync::OnceLock<Arc<crate::net::Net>>,
+    /// Where the cluster's NFS storage is mounted (G11): `<data>/storage`.
+    storage: std::sync::OnceLock<PathBuf>,
 }
 
 /// A command's last update, as kept on disk.
@@ -66,7 +68,7 @@ impl Executor {
             tracing::warn!(command = %id, "was running when the worker stopped; reported failed");
             *k = Kept { status: CommandStatus::Failed as i32, message: "the worker restarted while running it".into(), result_json: String::new(), at_ms: now_ms() };
         }
-        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default(), net: Default::default() };
+        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default(), net: Default::default(), storage: Default::default() };
         e.save(&e.known.lock().expect("known lock"));
         Arc::new(e)
     }
@@ -88,6 +90,11 @@ impl Executor {
     /// The overlay this worker runs.
     pub fn with_net(&self, n: Arc<crate::net::Net>) {
         let _ = self.net.set(n);
+    }
+
+    /// Mounts shared storage (G11) under `dir`.
+    pub fn with_storage(&self, dir: PathBuf) {
+        let _ = self.storage.set(dir);
     }
 
     /// The stream updates go to from now on; `None` when there is none.
@@ -152,7 +159,12 @@ impl Executor {
         Ok(match op {
             Op::Ping(_) => ("pong".into(), serde_json::json!({ "pong": true, "at_ms": now_ms() })),
             Op::DockerInfo(_) => ("".into(), crate::docker::info(docker()?).await?),
-            Op::RunContainer(r) => {
+            Op::RunContainer(mut r) => {
+                if !r.storage.is_empty() {
+                    let base = anyhow::Context::context(self.storage.get().cloned(), "this worker keeps no shared storage")?;
+                    let run = r.clone();
+                    r.volumes = tokio::task::spawn_blocking(move || crate::storage::ready(&base, &run, &mut crate::storage::System)).await??;
+                }
                 let v = crate::docker::run(docker()?, &r).await?;
                 if let (Some(n), false) = (self.net.get(), r.network_stack.is_empty()) {
                     // Without it the stack's workloads on other nodes are not reached from here: said, not fatal.

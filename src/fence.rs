@@ -1,5 +1,5 @@
 //! Self-fencing (G6, plan 7.1). A worker that hears from no manager for `stop` stops every managed container and is
-//! fenced; `storage` later it would stop shared-storage writes (nothing to do until G11); `reboot` after that it
+//! fenced; `storage` later it unmounts the cluster's NFS storage (G11); `reboot` after that it
 //! reboots if a managed container still runs (or always, or never, as configured). A fenced worker runs no managed
 //! workload until the managers authorize it (`Authorize`), and it stays fenced across a restart and a reboot: the
 //! state is a file in its data folder. A reboot the worker did not ask for fences it too, since it cannot know what
@@ -204,10 +204,10 @@ impl Fence {
 }
 
 /// The countdown, once a second until the process ends: past `stop` it fences and stops every managed container
-/// (again each second while one still runs), past `stop + storage + reboot` it reboots once if the policy says so.
+/// (again each second while one still runs), past `stop + storage` it unmounts the cluster's NFS storage, past `stop + storage + reboot` it reboots once if the policy says so.
 /// Fenced, it holds no floating address either (G10.3), taken off before the workloads stop. Each round also tells systemd's watchdog the worker is alive: a worker frozen anywhere stops saying so, and its
 /// unit restarts it (and reboots the node if it will not come back), so a frozen worker still fences.
-pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, net: Option<std::sync::Arc<crate::net::Net>>) {
+pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, net: Option<std::sync::Arc<crate::net::Net>>, storage: Option<std::path::PathBuf>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut rebooting = false;
@@ -236,6 +236,15 @@ pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, ne
             }),
             None => 0,
         };
+        // Past `stop + storage`: the shared storage's writes are taken away (G11), whatever still runs.
+        if let (true, Some(base)) = (st >= Stage::Storage, &storage) {
+            let base = base.clone();
+            let mounted = crate::storage::mount_points(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
+            if mounted.iter().any(|m| m.starts_with(&base) && *m != base) {
+                let n = tokio::task::spawn_blocking(move || crate::storage::unmount_all(&base, &mounted, &mut crate::storage::System)).await.unwrap_or(0);
+                tracing::warn!("fence: shared storage unmounted ({n})");
+            }
+        }
         if st == Stage::Reboot && !rebooting && f.reboot_due(running > 0) {
             rebooting = true;
             tracing::error!("fence: rebooting the node ({} managed container(s) still running)", if running == usize::MAX { "unknown".to_string() } else { running.to_string() });
