@@ -99,6 +99,23 @@ pub fn cluster_s(labels: Option<&HashMap<String, String>>) -> bool {
     labels.is_some_and(|l| l.get(LABEL_MANAGED).is_some_and(|v| v == "true") || l.contains_key(LABEL_WORKLOAD))
 }
 
+/// The volumes the cluster's containers mount, by name, with the stack of the container: the cluster's, though Docker
+/// made them without its label (a Compose volume made when its workload's container was).
+pub fn held(containers: &[bollard::models::ContainerSummary]) -> HashMap<String, Option<String>> {
+    containers
+        .iter()
+        .filter(|c| cluster_s(c.labels.as_ref()))
+        .flat_map(|c| {
+            let stack = c.labels.as_ref().and_then(|l| l.get(LABEL_STACK)).cloned();
+            c.mounts.iter().flatten().filter_map(move |m| m.name.clone().map(|n| (n, stack.clone())))
+        })
+        .collect()
+}
+
+async fn held_now(d: &Docker) -> Result<HashMap<String, Option<String>>> {
+    Ok(held(&d.list_containers(Some(q::ListContainersOptions { all: true, ..Default::default() })).await?))
+}
+
 /// How many lines of log to read: `tail` from the request, 1 to 5000, 500 when not given.
 pub fn tail(params: &HashMap<String, String>) -> u32 {
     params.get("tail").and_then(|t| t.parse().ok()).unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL)
@@ -168,7 +185,12 @@ async fn run(d: &Docker, r: &DockerRequest) -> Result<Value> {
         }
         Volumes => {
             let list = d.list_volumes(None::<q::ListVolumesOptions>).await?.volumes.unwrap_or_default();
-            Value::Array(list.into_iter().map(|v| json!({ "name": v.name, "driver": v.driver, "mountpoint": v.mountpoint, "created": v.created_at, "cluster": cluster_s(Some(&v.labels)), "stack": v.labels.get(LABEL_STACK) })).collect())
+            let held = held_now(d).await?;
+            Value::Array(list.into_iter().map(|v| {
+                let by = held.get(&v.name);
+                let stack = v.labels.get(LABEL_STACK).cloned().or_else(|| by.cloned().flatten());
+                json!({ "name": v.name, "driver": v.driver, "mountpoint": v.mountpoint, "created": v.created_at, "cluster": cluster_s(Some(&v.labels)) || by.is_some(), "stack": stack })
+            }).collect())
         }
         Networks => {
             let list = d.list_networks(None::<q::ListNetworksOptions>).await?;
@@ -219,7 +241,7 @@ async fn run(d: &Docker, r: &DockerRequest) -> Result<Value> {
         }
         RemoveVolume => {
             let v = d.inspect_volume(t).await?;
-            if cluster_s(Some(&v.labels)) {
+            if cluster_s(Some(&v.labels)) || held_now(d).await?.contains_key(t) {
                 bail!("this volume is the cluster's: it goes with its stack");
             }
             d.remove_volume(t, Some(q::RemoveVolumeOptions { force: false })).await?;
@@ -272,6 +294,19 @@ mod tests {
         assert!(cluster_s(Some(&l(LABEL_WORKLOAD, "web.nginx.1"))));
         assert!(!cluster_s(Some(&l("com.docker.compose.project", "x"))));
         assert!(!cluster_s(None));
+    }
+
+    #[test]
+    fn a_volume_a_cluster_container_mounts_is_the_cluster_s() {
+        use bollard::models::{ContainerSummary, MountPoint};
+        let c = |labels: &[(&str, &str)], vols: &[&str]| ContainerSummary {
+            labels: Some(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+            mounts: Some(vols.iter().map(|v| MountPoint { name: Some(v.to_string()), ..Default::default() }).collect()),
+            ..Default::default()
+        };
+        let mounted = held(&[c(&[(LABEL_MANAGED, "true"), (LABEL_STACK, "rec")], &["recdata"]), c(&[], &["mine"])]);
+        assert_eq!(mounted.get("recdata"), Some(&Some("rec".to_string())));
+        assert!(!mounted.contains_key("mine"), "an outside container's volume is the node's");
     }
 
     #[test]
