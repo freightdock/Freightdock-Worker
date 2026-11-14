@@ -88,7 +88,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = Files::in_dir(dir.path());
         let t = JoinToken { ca_sha256: "a".repeat(64), secret: "b".repeat(64) };
-        let mut c = Config { managers: vec![], token: Some(t.to_string()), token_file: None, data_dir: dir.path().into(), docker: "/x".into(), labels: Default::default() };
+        let mut c = Config { managers: vec![], token: Some(t.to_string()), token_file: None, data_dir: dir.path().into(), docker: "/x".into(), labels: Default::default(), host_shell: true };
         assert_eq!(fresh_token(&c, &files), Some(t.to_string()));
         std::fs::write(&files.spent, t.secret_hash()).unwrap();
         assert_eq!(fresh_token(&c, &files), None, "a token is tried once");
@@ -101,7 +101,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = Files::in_dir(dir.path());
         let path = dir.path().join("local-worker.token");
-        let c = Config { managers: vec![], token: None, token_file: Some(path.clone()), data_dir: dir.path().into(), docker: "/x".into(), labels: Default::default() };
+        let c = Config { managers: vec![], token: None, token_file: Some(path.clone()), data_dir: dir.path().into(), docker: "/x".into(), labels: Default::default(), host_shell: true };
         assert_eq!(fresh_token(&c, &files), None, "not there yet: the next start tries again");
         let t = JoinToken { ca_sha256: "a".repeat(64), secret: "c".repeat(64) };
         std::fs::write(&path, format!("{t}\n")).unwrap();

@@ -46,7 +46,7 @@ impl Probe {
     }
 }
 
-pub fn capabilities(docker_version: Option<String>) -> Capabilities {
+pub fn capabilities(docker_version: Option<String>, host_shell: bool) -> Capabilities {
     Capabilities {
         docker: docker_version.is_some(),
         docker_version: docker_version.unwrap_or_default(),
@@ -54,5 +54,7 @@ pub fn capabilities(docker_version: Option<String>) -> Capabilities {
         arch: std::env::consts::ARCH.to_string(),
         kernel: sysinfo::System::kernel_version().unwrap_or_default(),
         docker_requests: true,
+        shells: true,
+        host_shell,
     }
 }

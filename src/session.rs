@@ -34,6 +34,8 @@ pub struct Worker {
     pub fence: Arc<crate::fence::Fence>,
     /// The overlay (G9); `None` when its key could not be made.
     pub net: Option<Arc<crate::net::Net>>,
+    /// The shells open now (the UI's terminal).
+    pub shells: Arc<crate::shell::Shells>,
 }
 
 /// What the hello and heartbeats say of the fence.
@@ -105,7 +107,7 @@ impl Worker {
             network: self.net.as_ref().map(|n| n.report()),
             labels: self.config.labels.clone().into_iter().collect(),
             resources: Some(self.probe.resources(running)),
-            capabilities: Some(crate::host::capabilities(docker_version)),
+            capabilities: Some(crate::host::capabilities(docker_version, self.config.host_shell)),
             in_flight: self.exec.in_flight(),
             workloads: match &self.docker {
                 Some(d) => crate::docker::workloads(d).await,
@@ -132,7 +134,7 @@ impl Worker {
         self.exec.attach(Some(tx.clone()));
         if welcome.renew_certificate {
             // Its certificate expires within a year: a new one now, used from the next stream on.
-            let files = Files::in_dir(&self.config.data_dir);
+            let (files, ch) = (Files::in_dir(&self.config.data_dir), ch.clone());
             tokio::spawn(async move {
                 match crate::enrol::renew(&files, ch).await {
                     Ok(()) => tracing::info!("renewed this node's certificate; the next stream uses it"),
@@ -203,6 +205,10 @@ impl Worker {
                             let reply = crate::pages::answer(docker.as_ref(), &r).await;
                             let _ = tx.send(WorkerMessage { body: Some(worker_message::Body::DockerReply(reply)) }).await;
                         });
+                    }
+                    // A person's shell: on a stream of its own to this manager, beside the session.
+                    Some(manager_message::Body::ShellOpen(o)) => {
+                        tokio::spawn(crate::shell::serve(ch.clone(), self.docker.clone(), self.shells.clone(), o));
                     }
                     // The node's overlay, whole: applied beside the stream, an older one than applied ignored.
                     Some(manager_message::Body::Network(n)) => {

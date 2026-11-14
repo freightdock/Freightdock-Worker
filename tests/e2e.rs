@@ -52,7 +52,7 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     let (m, server) = manager(mdir.path(), port).await;
     let t = token(&m).await;
 
-    let config = Config { managers: vec![format!("127.0.0.1:{port}")], token: Some(t.clone()), token_file: None, data_dir: wdir.path().into(), docker: "/nonexistent".into(), labels: [("region".to_string(), "lab".to_string())].into() };
+    let config = Config { managers: vec![format!("127.0.0.1:{port}")], token: Some(t.clone()), token_file: None, data_dir: wdir.path().into(), docker: "/nonexistent".into(), labels: [("region".to_string(), "lab".to_string())].into(), host_shell: true };
     let files = Files::in_dir(wdir.path());
     enrol::enrol(&config, &files, &t, "test-host").await.unwrap();
     assert!(files.enrolled());
@@ -66,7 +66,7 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     let exec = Executor::new(node_id.clone(), None, Some(wdir.path().join("commands.json")));
     let net = freightdock_worker::net::Net::open(wdir.path()).unwrap();
     let key = net.report().public_key;
-    let w = Arc::new(Worker { config, files, node_id: node_id.clone(), hostname: "test-host".into(), docker: None, exec, probe: Probe::default(), net: Some(net), fence: Arc::new(freightdock_worker::fence::Fence::open(None, "boot".into(), Default::default(), freightdock_worker::fence::RebootPolicy::Never, true)) });
+    let w = Arc::new(Worker { config, files, node_id: node_id.clone(), hostname: "test-host".into(), docker: None, exec, probe: Probe::default(), net: Some(net), shells: freightdock_worker::shell::Shells::new(true), fence: Arc::new(freightdock_worker::fence::Fence::open(None, "boot".into(), Default::default(), freightdock_worker::fence::RebootPolicy::Never, true)) });
     let run = tokio::spawn({
         let w = w.clone();
         async move { w.run().await }
@@ -89,6 +89,32 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
     assert_eq!(e.to_string(), "this worker has no Docker");
     let e = m.docker(&node_id, "exec", "x", Default::default()).await.unwrap_err();
     assert!(e.to_string().contains("not something"), "{e}");
+
+    // A shell on the host (the UI's terminal): opened on the worker's own stream to the manager, what is typed run on
+    // a terminal of its own, its output and exit code back. A container's needs a Docker this worker has not.
+    let caps = m.store.read(|s| s.nodes[&node_id].report.clone().unwrap());
+    assert!(caps.shells && caps.host_shell, "the worker says it opens shells");
+    let mut pipe = m.shell(&node_id, "", 100, 30).await.unwrap();
+    use freightdock_proto::v1::{ShellDown, shell_down, shell_up};
+    pipe.down.send(ShellDown { body: Some(shell_down::Body::Input(b"stty size; echo hi-$((1+2)); exit 7\n".to_vec())) }).await.unwrap();
+    let (mut seen, mut code) = (String::new(), None);
+    while let Ok(Some(u)) = tokio::time::timeout(Duration::from_secs(20), pipe.up.recv()).await {
+        match u.body {
+            Some(shell_up::Body::Output(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Some(shell_up::Body::End(e)) => {
+                code = Some((e.exit_code, e.error));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(seen.contains("hi-3") && seen.contains("30 100"), "{seen:?}");
+    assert_eq!(code, Some((7, String::new())), "{seen:?}");
+    let mut pipe = m.shell(&node_id, "web", 80, 24).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(10), pipe.up.recv()).await.unwrap().and_then(|u| u.body) {
+        Some(shell_up::Body::End(e)) => assert!(e.error.contains("no Docker"), "{e:?}"),
+        other => panic!("{other:?}"),
+    }
 
     // G2.7: a new certificate, asked with the current one; the worker comes back with it, and the old one still opens.
     let before = m.store.read(|s| s.nodes[&node_id].cert_sha256.clone());

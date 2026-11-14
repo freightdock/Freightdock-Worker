@@ -61,7 +61,8 @@ async fn main() -> Result<()> {
     };
     tokio::spawn(freightdock_worker::fence::watch(fence.clone(), docker.clone(), net.clone(), Some(config.data_dir.join("storage")), exec.storage_health()));
     freightdock_worker::fence::notify("READY=1");
-    let w = Worker { config, files, node_id, hostname, docker, exec, probe: Probe::default(), fence, net };
+    let shells = freightdock_worker::shell::Shells::new(config.host_shell);
+    let w = Worker { config, files, node_id, hostname, docker, exec, probe: Probe::default(), fence, net, shells };
     tokio::select! {
         r = w.run() => r,
         _ = tokio::signal::ctrl_c() => { tracing::info!("stopping"); Ok(()) }

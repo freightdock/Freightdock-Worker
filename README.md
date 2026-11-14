@@ -38,6 +38,7 @@ deploy/          systemd unit
 | `FREIGHTDOCK_WORKER_DATA` | `/var/lib/freightdock-worker` | Node id, key, certificate, cluster CA, managers learned, command journal, the WireGuard key |
 | `FREIGHTDOCK_DOCKER` | `unix:///var/run/docker.sock` | The Docker socket |
 | `FREIGHTDOCK_LABELS` | | Node labels, `key=value,key=value` |
+| `FREIGHTDOCK_WORKER_HOST_SHELL` | `on` | `off`: no shell on this host from the UI (a container's is still offered); the managers cannot turn it back on |
 | `RUST_LOG` | `freightdock_worker=info,warn` | How much it logs |
 
 While Contracts and Manager are not published, this crate takes them by path (`../Freightdock-Contracts`, and `../Freightdock-Manager` for

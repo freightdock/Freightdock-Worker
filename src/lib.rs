@@ -15,6 +15,7 @@ pub mod host;
 pub mod net;
 pub mod pages;
 pub mod session;
+pub mod shell;
 pub mod storage;
 pub mod tls;
 
@@ -38,6 +39,9 @@ pub struct Config {
     /// The Docker socket.
     pub docker: PathBuf,
     pub labels: BTreeMap<String, String>,
+    /// Whether a person may open the host's own shell from the UI (`FREIGHTDOCK_WORKER_HOST_SHELL`, on unless `off`);
+    /// containers' shells are always offered.
+    pub host_shell: bool,
 }
 
 impl Config {
@@ -52,7 +56,12 @@ impl Config {
         let docker = get("FREIGHTDOCK_DOCKER").unwrap_or_else(|| "unix:///var/run/docker.sock".into());
         let docker = PathBuf::from(docker.strip_prefix("unix://").unwrap_or(&docker));
         let labels = parse_labels(&get("FREIGHTDOCK_LABELS").unwrap_or_default())?;
-        Ok(Config { managers, token, token_file, data_dir, docker, labels })
+        let host_shell = match get("FREIGHTDOCK_WORKER_HOST_SHELL").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("" | "on" | "true" | "yes" | "1") => true,
+            Some("off" | "false" | "no" | "0") => false,
+            Some(v) => bail!("FREIGHTDOCK_WORKER_HOST_SHELL is on or off, not {v:?}"),
+        };
+        Ok(Config { managers, token, token_file, data_dir, docker, labels, host_shell })
     }
 }
 
@@ -175,6 +184,16 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_host_s_shell_is_on_unless_the_node_s_owner_turns_it_off() {
+        let env = |v: Option<&'static str>| move |k: &str| (k == "FREIGHTDOCK_WORKER_HOST_SHELL").then_some(v).flatten().map(String::from);
+        assert!(Config::from(env(None)).unwrap().host_shell);
+        assert!(Config::from(env(Some("on"))).unwrap().host_shell);
+        assert!(!Config::from(env(Some("off"))).unwrap().host_shell);
+        assert!(!Config::from(env(Some("No"))).unwrap().host_shell);
+        assert!(Config::from(env(Some("maybe"))).is_err());
+    }
+
     use super::*;
 
     #[test]
