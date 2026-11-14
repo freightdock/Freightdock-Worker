@@ -9,7 +9,7 @@
 //! again blind is how things get done twice. The manager decides what to do next.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -148,7 +148,7 @@ impl Executor {
             return self.report(&id, CommandStatus::Expired, "its deadline passed before it reached this worker", String::new());
         }
         let Some(op) = c.op else { return self.report(&id, CommandStatus::Rejected, "an operation this worker does not know", String::new()) };
-        if matches!(op, Op::RunContainer(_) | Op::CephCommand(_)) && self.fence.get().is_some_and(|f| f.fenced().is_some()) {
+        if matches!(op, Op::RunContainer(_) | Op::CephCommand(_) | Op::Cephadm(_)) && self.fence.get().is_some_and(|f| f.fenced().is_some()) {
             return self.report(&id, CommandStatus::Rejected, "this node is fenced and waits for the managers to authorize it", String::new());
         }
         self.report(&id, CommandStatus::Received, "", String::new());
@@ -193,6 +193,13 @@ impl Executor {
             }
             Op::StopContainer(s) => ("stopped".into(), crate::docker::stop(docker()?, &s).await?),
             Op::CephCommand(c) => ("ran ceph".into(), crate::ceph::run(docker()?, &c).await?),
+            Op::Cephadm(c) => {
+                // cephadm lives beside the worker's other files (the storage directory's parent).
+                let data = self.storage.get().and_then(|s| s.parent()).map(Path::to_path_buf).ok_or_else(|| anyhow::anyhow!("this worker has no data directory"))?;
+                let action = c.action.clone();
+                let v = tokio::task::spawn_blocking(move || crate::cephadm::run(&c, &crate::cephadm::Paths::system(&data), &mut crate::storage::System)).await??;
+                (format!("cephadm {action}"), v)
+            }
             Op::RemoveContainer(r) => {
                 let d = docker()?;
                 let (v, left) = crate::docker::remove(d, &r).await?;

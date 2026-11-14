@@ -39,6 +39,8 @@ pub enum Action {
     PruneImages,
     RemoveVolume,
     RemoveNetwork,
+    /// The host's disks, for Ceph made from the UI (G12.6).
+    Disks,
 }
 
 /// What a target names, to check it before it goes into a Docker API path.
@@ -69,6 +71,7 @@ impl Action {
             "images.prune" => PruneImages,
             "volume.remove" => RemoveVolume,
             "network.remove" => RemoveNetwork,
+            "disks" => Disks,
             _ => return None,
         })
     }
@@ -76,7 +79,7 @@ impl Action {
     fn target(self) -> Kind {
         use Action::*;
         match self {
-            Info | Containers | Images | Volumes | Networks | PruneImages | PullImage => Kind::None,
+            Info | Containers | Images | Volumes | Networks | PruneImages | PullImage | Disks => Kind::None,
             RemoveImage => Kind::Image,
             _ => Kind::Object,
         }
@@ -157,6 +160,10 @@ async fn run(d: &Docker, r: &DockerRequest) -> Result<Value> {
     use Action::*;
     Ok(match a {
         Info => crate::docker::info(d).await?,
+        Disks => {
+            let out = tokio::task::spawn_blocking(|| crate::storage::Run::run(&mut crate::storage::System, "lsblk", &["-J", "-b", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL,ROTA,RO"])).await??;
+            crate::cephadm::disks_in(&out, crate::cephadm::in_container())?
+        }
         Containers => {
             let list = d.list_containers(Some(q::ListContainersOptions { all: true, ..Default::default() })).await?;
             Value::Array(list.into_iter().map(|c| {
