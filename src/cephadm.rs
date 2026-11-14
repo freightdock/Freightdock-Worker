@@ -116,7 +116,7 @@ pub fn disks_in(lsblk: &str, container: bool) -> Result<Value> {
                 let why = if container {
                     Some("this node is a container: Ceph needs a VM or a machine")
                 } else if ceph {
-                    Some("Ceph's already")
+                    Some("already a Ceph disk (an OSD)")
                 } else if d["ro"] == true {
                     Some("read-only")
                 } else if !children.is_empty() {
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(said, [
             ("/dev/vda".into(), false, "has partitions or volumes".into()),
             ("/dev/vdb".into(), true, String::new()),
-            ("/dev/vdc".into(), false, "Ceph's already".into()),
+            ("/dev/vdc".into(), false, "already a Ceph disk (an OSD)".into()),
             ("/dev/vdd".into(), false, "has a filesystem".into()),
             ("/dev/vde".into(), false, "smaller than 5 GB".into()),
         ]);
