@@ -5,6 +5,7 @@
 //!
 //! It executes what the managers decide and decides nothing cluster-wide itself.
 
+pub mod ceph;
 pub mod docker;
 pub mod enrol;
 pub mod exec;

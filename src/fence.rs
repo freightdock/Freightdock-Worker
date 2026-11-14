@@ -207,7 +207,7 @@ impl Fence {
 /// (again each second while one still runs), past `stop + storage` it unmounts the cluster's NFS storage, past `stop + storage + reboot` it reboots once if the policy says so.
 /// Fenced, it holds no floating address either (G10.3), taken off before the workloads stop. Each round also tells systemd's watchdog the worker is alive: a worker frozen anywhere stops saying so, and its
 /// unit restarts it (and reboots the node if it will not come back), so a frozen worker still fences.
-pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, net: Option<std::sync::Arc<crate::net::Net>>, storage: Option<std::path::PathBuf>) {
+pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, net: Option<std::sync::Arc<crate::net::Net>>, storage: Option<std::path::PathBuf>, health: Option<std::sync::Arc<crate::storage::Health>>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut rebooting = false;
@@ -243,6 +243,9 @@ pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, ne
             if mounted.iter().any(|m| m.starts_with(&base) && *m != base) {
                 let n = tokio::task::spawn_blocking(move || crate::storage::unmount_all(&base, &mounted, &mut crate::storage::System)).await.unwrap_or(0);
                 tracing::warn!("fence: shared storage unmounted ({n})");
+                if let Some(h) = &health {
+                    h.forget_mounted();
+                }
             }
         }
         if st == Stage::Reboot && !rebooting && f.reboot_due(running > 0) {

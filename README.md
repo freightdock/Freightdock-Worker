@@ -18,9 +18,12 @@ src/docker.rs    Docker operations, workloads found by the label io.freightdock.
 src/pages.rs     the node's Docker for a person (the UI's per-node pages): DockerRequest answered beside the
                  stream, never journalled; the cluster's own containers, networks and volumes never changed this way
 src/host.rs      what it reports of its host: names, boot id, resources, capabilities
-src/storage.rs   shared storage (G11): an NFS export mounted or a shared directory found, a volume's directory on it,
-                 unmounted when fencing; each one made ready probed every 15 s (mounted, space, a file written and
-                 read back, a hung probe said after 10 s) and reported in the heartbeat (G11.8)
+src/storage.rs   shared storage (G11): an NFS export mounted, a CephFS mounted by the kernel (mount(2), its key in the
+                 call only), or a shared directory found, a volume's directory on it, unmounted when fencing (and
+                 forgotten until mounted again); each one made ready probed every 15 s (mounted, space, a file written
+                 and read back, a hung probe said after 10 s) and reported in the heartbeat (G11.8)
+src/ceph.rs      CephCommand (G12.6): the `ceph` CLI once in a throwaway container of the Ceph image, its config and
+                 key put into the container before it starts, never on the node's disk or a command line
 src/net.rs       the overlay (G9): the WireGuard key (wg.key), the managers' network state applied by
                  Freightdock-Network's agent, a stack's Docker network (fd-<stack>) made when a workload of it runs
 tests/e2e.rs     a real manager in process: enrolment, the session, commands

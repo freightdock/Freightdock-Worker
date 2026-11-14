@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             None
         }
     };
-    tokio::spawn(freightdock_worker::fence::watch(fence.clone(), docker.clone(), net.clone(), Some(config.data_dir.join("storage"))));
+    tokio::spawn(freightdock_worker::fence::watch(fence.clone(), docker.clone(), net.clone(), Some(config.data_dir.join("storage")), exec.storage_health()));
     freightdock_worker::fence::notify("READY=1");
     let w = Worker { config, files, node_id, hostname, docker, exec, probe: Probe::default(), fence, net };
     tokio::select! {

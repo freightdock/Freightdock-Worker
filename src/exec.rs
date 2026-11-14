@@ -148,7 +148,7 @@ impl Executor {
             return self.report(&id, CommandStatus::Expired, "its deadline passed before it reached this worker", String::new());
         }
         let Some(op) = c.op else { return self.report(&id, CommandStatus::Rejected, "an operation this worker does not know", String::new()) };
-        if matches!(op, Op::RunContainer(_)) && self.fence.get().is_some_and(|f| f.fenced().is_some()) {
+        if matches!(op, Op::RunContainer(_) | Op::CephCommand(_)) && self.fence.get().is_some_and(|f| f.fenced().is_some()) {
             return self.report(&id, CommandStatus::Rejected, "this node is fenced and waits for the managers to authorize it", String::new());
         }
         self.report(&id, CommandStatus::Received, "", String::new());
@@ -192,6 +192,7 @@ impl Executor {
                 ("running".into(), v)
             }
             Op::StopContainer(s) => ("stopped".into(), crate::docker::stop(docker()?, &s).await?),
+            Op::CephCommand(c) => ("ran ceph".into(), crate::ceph::run(docker()?, &c).await?),
             Op::RemoveContainer(r) => {
                 let d = docker()?;
                 let (v, left) = crate::docker::remove(d, &r).await?;

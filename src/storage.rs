@@ -1,7 +1,8 @@
 //! The cluster's shared storage on this node (G11, plan 8.1): made ready before a workload whose volumes are on it
 //! runs, and its writes taken away when the node fences. No filesystem of our own and nothing in the read and write
-//! path: an NFS export is mounted with the system's `mount` under `<data>/storage/<name>`, and a `path` storage is a
-//! directory the host already shares (a mount it has, a bind mount into a container), only checked. Each volume is a
+//! path: an NFS export is mounted with the system's `mount` under `<data>/storage/<name>`, a CephFS by the kernel's
+//! own client there (mount(2), its key in the call and nowhere else: no ceph-common needed, nothing on disk), and a
+//! `path` storage is a directory the host already shares (a mount it has, a bind mount into a container), only checked. Each volume is a
 //! directory `<stack>/<volume>` on it, bound into the container in place of a Docker volume of that name.
 
 use std::collections::BTreeMap;
@@ -13,6 +14,8 @@ use freightdock_proto::v1;
 /// Runs a program and gives back what it printed; an exit other than 0 is an error with what it wrote to stderr.
 pub trait Run {
     fn run(&mut self, prog: &str, args: &[&str]) -> Result<String>;
+    /// mount(2): a filesystem the kernel mounts itself, `data` its options as the kernel takes them.
+    fn mount(&mut self, fstype: &str, source: &str, target: &Path, data: &str) -> Result<()>;
 }
 
 /// The real one.
@@ -26,6 +29,31 @@ impl Run for System {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+
+    fn mount(&mut self, fstype: &str, source: &str, target: &Path, data: &str) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |s: &[u8]| std::ffi::CString::new(s).context("a NUL in a mount argument");
+        let (src, at, ty, opts) = (c(source.as_bytes())?, c(target.as_os_str().as_bytes())?, c(fstype.as_bytes())?, c(data.as_bytes())?);
+        // SAFETY: NUL-terminated strings that live through the call.
+        if unsafe { libc::mount(src.as_ptr(), at.as_ptr(), ty.as_ptr(), 0, opts.as_ptr().cast()) } != 0 {
+            bail!("mount -t {fstype} {source} {}: {}", target.display(), std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// A CephFS source as the kernel takes it: the monitors' addresses (IP, maybe a port; the kernel resolves no names),
+/// then `:` and an absolute path, `/` for the whole filesystem.
+fn ceph_source(s: &str) -> bool {
+    let Some(i) = s.find(":/") else { return false };
+    let (mons, path) = (&s[..i], &s[i + 1..]);
+    let mon = |m: &str| m.parse::<std::net::IpAddr>().is_ok() || m.parse::<std::net::SocketAddr>().is_ok() || m.strip_prefix('[').and_then(|r| r.strip_suffix(']')).is_some_and(|v6| v6.parse::<std::net::Ipv6Addr>().is_ok());
+    !mons.is_empty() && mons.split(',').all(mon) && (path == "/" || absolute(path))
+}
+
+/// Options that carry no key: the key comes on its own, never from the storage's options.
+fn keyless(options: &str) -> bool {
+    plain(options, "=,._:-/") && !options.split(',').any(|o| matches!(o.split('=').next(), Some("secret" | "secretfile" | "key" | "keyfile")))
 }
 
 fn plain(s: &str, extra: &str) -> bool {
@@ -47,6 +75,12 @@ pub fn root_of(base: &Path, v: &v1::StorageVolume) -> Result<PathBuf> {
             let ok = v.source.split_once(":/").is_some_and(|(host, path)| !host.is_empty() && plain(host, ".-[]") && absolute(&format!("/{path}")));
             if !ok || !plain(&v.options, "=,._:-/") {
                 bail!("storage {}: {:?} is not host:/export (with plain options)", v.storage, v.source);
+            }
+            Ok(base.join(&v.storage))
+        }
+        "cephfs" => {
+            if !ceph_source(&v.source) || !keyless(&v.options) || !plain(&v.secret, "+/=") {
+                bail!("storage {}: {:?} is not monitors:/path (with plain options and the key on its own)", v.storage, v.source);
             }
             Ok(base.join(&v.storage))
         }
@@ -93,6 +127,15 @@ pub fn prepare(base: &Path, v: &v1::StorageVolume, mounted: &[PathBuf], run: &mu
             args.extend([v.source.as_str(), at.as_str()]);
             run.run("mount", &args).with_context(|| format!("storage {}: mounting {}", v.storage, v.source))?;
         }
+        "cephfs" if !mounted.contains(&root) => {
+            std::fs::create_dir_all(&root).with_context(|| format!("making {}", root.display()))?;
+            // `fs=` is mount.ceph's word for it; the kernel takes `mds_namespace=`.
+            let mut data = v.options.split(',').filter(|o| !o.is_empty()).map(|o| o.strip_prefix("fs=").map_or_else(|| o.to_string(), |f| format!("mds_namespace={f}"))).collect::<Vec<_>>().join(",");
+            if !v.secret.is_empty() {
+                data = if data.is_empty() { format!("secret={}", v.secret) } else { format!("{data},secret={}", v.secret) };
+            }
+            run.mount("ceph", &v.source, &root, &data).with_context(|| format!("storage {}: mounting {}", v.storage, v.source))?;
+        }
         "path" if !root.is_dir() => bail!("storage {}: {} is not on this node", v.storage, root.display()),
         _ => {}
     }
@@ -112,7 +155,7 @@ pub fn bind(volumes: &[String], dirs: &BTreeMap<String, PathBuf>) -> Vec<String>
         .collect()
 }
 
-/// Takes the node's writes to shared storage away (plan 7.1, after its workloads stopped): every NFS mount under
+/// Takes the node's writes to shared storage away (plan 7.1, after its workloads stopped): every NFS and CephFS mount under
 /// `base` is unmounted, forced and lazily, so a process still holding a file there loses it. A path storage is the
 /// host's to take away. Gives back how many it unmounted.
 pub fn unmount_all(base: &Path, mounted: &[PathBuf], run: &mut impl Run) -> usize {
@@ -168,7 +211,7 @@ pub fn probe(name: &str, driver: &str, root: &Path, node_id: &str, mounted: &[Pa
     let started = std::time::Instant::now();
     let mut h = v1::StorageHealth { name: name.into(), driver: driver.into(), at_ms: unix_ms(), ..Default::default() };
     let r: Result<()> = (|| {
-        if driver == "nfs" && !mounted.iter().any(|m| m == root) {
+        if matches!(driver, "nfs" | "cephfs") && !mounted.iter().any(|m| m == root) {
             bail!("{} is not mounted at {}", name, root.display());
         }
         if !root.is_dir() {
@@ -235,6 +278,18 @@ impl Health {
             return;
         }
         k.insert(name.into(), Known { driver: driver.into(), root: root.into(), last: None, probing: None });
+        self.save(&k);
+    }
+
+    /// The storage the node mounts (nfs, cephfs) forgotten, as fencing unmounted it: it is not this node's to answer
+    /// for until a workload needs it again (and mounts it), so the managers do not take it for failing here.
+    pub fn forget_mounted(&self) {
+        let mut k = self.lock();
+        k.retain(|_, x| !matches!(x.driver.as_str(), "nfs" | "cephfs"));
+        self.save(&k);
+    }
+
+    fn save(&self, k: &BTreeMap<String, Known>) {
         if let Some(f) = &self.file {
             let saved: BTreeMap<&String, (&String, &PathBuf)> = k.iter().map(|(n, x)| (n, (&x.driver, &x.root))).collect();
             if let Err(e) = serde_json::to_vec(&saved).map_err(std::io::Error::other).and_then(|b| std::fs::write(f, b)) {
@@ -302,6 +357,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         calls: Vec<String>,
+        secrets: Vec<String>,
         fail: bool,
     }
 
@@ -313,10 +369,69 @@ mod tests {
             }
             Ok(String::new())
         }
+
+        fn mount(&mut self, fstype: &str, source: &str, target: &Path, data: &str) -> Result<()> {
+            let (shown, secret) = match data.split_once(",secret=") {
+                Some((o, k)) => (format!("{o},secret=<key>"), Some(k.to_string())),
+                None => (data.to_string(), None),
+            };
+            self.calls.push(format!("mount({fstype}) {source} {} {shown}", target.display()));
+            self.secrets.extend(secret);
+            if self.fail {
+                bail!("no");
+            }
+            Ok(())
+        }
     }
 
     fn nfs() -> v1::StorageVolume {
-        v1::StorageVolume { volume: "pg".into(), storage: "nas".into(), driver: "nfs".into(), source: "192.0.2.50:/export/fd".into(), options: "vers=4.2,hard".into(), dir: "app/pg".into() }
+        v1::StorageVolume { volume: "pg".into(), storage: "nas".into(), driver: "nfs".into(), source: "192.0.2.50:/export/fd".into(), options: "vers=4.2,hard".into(), dir: "app/pg".into(), secret: String::new() }
+    }
+
+    fn cephfs() -> v1::StorageVolume {
+        v1::StorageVolume { storage: "ceph".into(), driver: "cephfs".into(), source: "192.0.2.1,192.0.2.2:6789,[2001:db8::3]:/".into(), options: "name=fd,fs=fs1".into(), secret: "AQBkZXZpY2Uta2V5LW9mLXRlc3Q=".into(), ..nfs() }
+    }
+
+    #[test]
+    fn a_cephfs_is_mounted_by_the_kernel_with_its_key_handed_over_and_never_on_a_command_line() {
+        let base = tempfile::tempdir().unwrap();
+        let mut f = Fake::default();
+        let dir = prepare(base.path(), &cephfs(), &[], &mut &mut f).unwrap();
+        let root = base.path().join("ceph");
+        assert_eq!(dir, root.join("app/pg"));
+        assert_eq!(f.calls, vec![format!("mount(ceph) 192.0.2.1,192.0.2.2:6789,[2001:db8::3]:/ {} name=fd,mds_namespace=fs1,secret=<key>", root.display())], "fs= is mount.ceph's word; the kernel's is mds_namespace=");
+        assert_eq!(f.secrets, vec!["AQBkZXZpY2Uta2V5LW9mLXRlc3Q="], "the key goes to the kernel");
+        assert!(std::fs::read_dir(base.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("secret")), "and to no file");
+        let mut f = Fake::default();
+        prepare(base.path(), &cephfs(), std::slice::from_ref(&root), &mut &mut f).unwrap();
+        assert!(f.calls.is_empty(), "mounted already: {:?}", f.calls);
+    }
+
+    #[test]
+    fn a_cephfs_is_named_by_its_monitors_addresses_and_takes_no_key_in_its_options() {
+        let base = tempfile::tempdir().unwrap();
+        let mut f = Fake::default();
+        for bad in [
+            v1::StorageVolume { source: "mon.example:/".into(), ..cephfs() },
+            v1::StorageVolume { source: "192.0.2.1:/../x".into(), ..cephfs() },
+            v1::StorageVolume { source: "192.0.2.1".into(), ..cephfs() },
+            v1::StorageVolume { source: ",192.0.2.1:/".into(), ..cephfs() },
+            v1::StorageVolume { options: "name=fd,secret=abc".into(), ..cephfs() },
+            v1::StorageVolume { options: "name=fd,secretfile=/etc/x".into(), ..cephfs() },
+            v1::StorageVolume { options: "name=fd fs=x".into(), ..cephfs() },
+            v1::StorageVolume { secret: "not,base64".into(), ..cephfs() },
+        ] {
+            assert!(prepare(base.path(), &bad, &[], &mut &mut f).is_err(), "{bad:?}");
+        }
+        assert!(f.calls.is_empty(), "nothing run: {:?}", f.calls);
+        assert!(root_of(base.path(), &v1::StorageVolume { source: "192.0.2.1:/shared/fd".into(), ..cephfs() }).is_ok());
+    }
+
+    #[test]
+    fn a_cephfs_not_mounted_is_unhealthy_as_an_nfs_one_is() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!probe("ceph", "cephfs", d.path(), "n1", &[]).ok);
+        assert!(probe("ceph", "cephfs", d.path(), "n1", &[d.path().to_path_buf()]).ok);
     }
 
     #[test]
@@ -360,6 +475,7 @@ mod tests {
             v1::StorageVolume { options: "vers=4,x y".into(), ..nfs() },
             v1::StorageVolume { driver: "path".into(), source: "/".into(), options: String::new(), ..nfs() },
             v1::StorageVolume { driver: "ceph".into(), ..nfs() },
+            v1::StorageVolume { driver: "cephfs".into(), source: "nas.example:/export".into(), ..nfs() },
         ] {
             assert!(prepare(base.path(), &bad, &[], &mut &mut f).is_err(), "{bad:?}");
         }
@@ -422,6 +538,21 @@ mod tests {
         assert!(said.ok && said.name == "share", "{said:?}");
         let again = Health::new("n1".into(), Some(file));
         assert_eq!(again.lock().keys().cloned().collect::<Vec<_>>(), ["share"]);
+    }
+
+    #[test]
+    fn the_storage_fencing_unmounted_is_forgotten_until_it_is_mounted_again() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("storage.json");
+        let h = Health::new("n1".into(), Some(file.clone()));
+        h.remember("nas", "nfs", Path::new("/x/nas"));
+        h.remember("ceph", "cephfs", Path::new("/x/ceph"));
+        h.remember("share", "path", d.path());
+        h.forget_mounted();
+        assert_eq!(h.lock().keys().cloned().collect::<Vec<_>>(), ["share"], "a path storage is the host's, still there");
+        assert_eq!(Health::new("n1".into(), Some(file)).lock().keys().cloned().collect::<Vec<_>>(), ["share"], "and so after a restart");
+        h.remember("ceph", "cephfs", Path::new("/x/ceph"));
+        assert!(h.lock().contains_key("ceph"));
     }
 
     #[test]

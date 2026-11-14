@@ -9,6 +9,7 @@ rust-version = "1.90"
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 bollard = "0.19"
 freightdock-network = { path = "../Freightdock-Network" }
 freightdock-proto = { path = "../Freightdock-Contracts" }
