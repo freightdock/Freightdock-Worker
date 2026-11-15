@@ -80,4 +80,6 @@ regexes = [
   '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
   # The cipher's name in prose ("key, XChaCha20-Poly1305"), which the generic rule takes for a key.
   '''XChaCha20-Poly1305''',
+  # The CephFS tests' made-up key: base64 of "device-key-of-test", in ceph.rs and storage.rs. No Ceph has it.
+  '''AQBkZXZpY2Uta2V5LW9mLXRlc3Q=''',
 ]
