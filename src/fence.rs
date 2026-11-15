@@ -1,5 +1,5 @@
 //! Self-fencing (G6, plan 7.1). A worker that hears from no manager for `stop` stops every managed container and is
-//! fenced; `storage` later it unmounts the cluster's NFS storage (G11); `reboot` after that it
+//! fenced; `storage` later it makes the cluster's mounted storage read-only and unmounts it (G11); `reboot` after that it
 //! reboots if a managed container still runs (or always, or never, as configured). A fenced worker runs no managed
 //! workload until the managers authorize it (`Authorize`), and it stays fenced across a restart and a reboot: the
 //! state is a file in its data folder. A reboot the worker did not ask for fences it too, since it cannot know what
@@ -204,7 +204,7 @@ impl Fence {
 }
 
 /// The countdown, once a second until the process ends: past `stop` it fences and stops every managed container
-/// (again each second while one still runs), past `stop + storage` it unmounts the cluster's NFS storage, past `stop + storage + reboot` it reboots once if the policy says so.
+/// (again each second while one still runs), past `stop + storage` it makes the cluster's mounted storage read-only and unmounts it, past `stop + storage + reboot` it reboots once if the policy says so.
 /// Fenced, it holds no floating address either (G10.3), taken off before the workloads stop. Each round also tells systemd's watchdog the worker is alive: a worker frozen anywhere stops saying so, and its
 /// unit restarts it (and reboots the node if it will not come back), so a frozen worker still fences.
 pub async fn watch(f: std::sync::Arc<Fence>, docker: Option<bollard::Docker>, net: Option<std::sync::Arc<crate::net::Net>>, storage: Option<std::path::PathBuf>, health: Option<std::sync::Arc<crate::storage::Health>>) {

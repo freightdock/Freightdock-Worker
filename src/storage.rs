@@ -1,7 +1,8 @@
 //! The cluster's shared storage on this node (G11, plan 8.1): made ready before a workload whose volumes are on it
 //! runs, and its writes taken away when the node fences. No filesystem of our own and nothing in the read and write
 //! path: an NFS export is mounted with the system's `mount` under `<data>/storage/<name>`, a CephFS by the kernel's
-//! own client there (mount(2), its key in the call and nowhere else: no ceph-common needed, nothing on disk), and a
+//! own client there (mount(2), its key in the call and nowhere else: no ceph-common needed, nothing on disk), an SMB
+//! share by the kernel's client the same way (its password in the call only; no cifs-utils needed), and a
 //! `path` storage is a directory the host already shares (a mount it has, a bind mount into a container), only checked. Each volume is a
 //! directory `<stack>/<volume>` on it, bound into the container in place of a Docker volume of that name.
 
@@ -65,6 +66,33 @@ fn absolute(p: &str) -> bool {
     p.starts_with('/') && p != "/" && !p.split('/').any(|c| c == "..") && plain(p, "/._-")
 }
 
+/// An SMB share as `//host/share` and maybe a path in it: a host name or address, a share name (a hidden one ends in
+/// `$`), and plain path parts that climb nowhere.
+fn smb_source(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix("//")?;
+    let (host, path) = rest.split_once('/')?;
+    let mut parts = path.split('/');
+    let share = parts.next()?;
+    let ok = !host.is_empty() && plain(host, ".-[]:") && !share.is_empty() && plain(share, "._-$") && parts.all(|p| !p.is_empty() && p != ".." && p != "." && plain(p, "._-"));
+    ok.then_some((host, share))
+}
+
+/// SMB options that carry no password: it comes on its own, never from the options or a file the node has.
+fn smb_keyless(options: &str) -> bool {
+    plain(options, "=,._:-/") && !options.split(',').any(|o| matches!(o.split('=').next(), Some("password" | "pass" | "password2" | "credentials" | "cred")))
+}
+
+/// The address the kernel's SMB client is given (`ip=`): it resolves no names itself without a helper.
+fn smb_ip(host: &str) -> Result<String> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(ip.to_string());
+    }
+    use std::net::ToSocketAddrs;
+    let a = (bare, 445).to_socket_addrs().with_context(|| format!("resolving {bare}"))?.next().with_context(|| format!("{bare} has no address"))?;
+    Ok(a.ip().to_string())
+}
+
 /// Where the storage is on this node: `<base>/<name>` for nfs (mounted there), the directory itself for path.
 pub fn root_of(base: &Path, v: &v1::StorageVolume) -> Result<PathBuf> {
     if v.storage.is_empty() || !plain(&v.storage, "-") {
@@ -81,6 +109,12 @@ pub fn root_of(base: &Path, v: &v1::StorageVolume) -> Result<PathBuf> {
         "cephfs" => {
             if !ceph_source(&v.source) || !keyless(&v.options) || !plain(&v.secret, "+/=") {
                 bail!("storage {}: {:?} is not monitors:/path (with plain options and the key on its own)", v.storage, v.source);
+            }
+            Ok(base.join(&v.storage))
+        }
+        "smb" => {
+            if smb_source(&v.source).is_none() || !smb_keyless(&v.options) || v.secret.chars().any(|c| c == '\0' || c.is_control()) {
+                bail!("storage {}: {:?} is not //host/share (with plain options and the password on its own)", v.storage, v.source);
             }
             Ok(base.join(&v.storage))
         }
@@ -136,6 +170,19 @@ pub fn prepare(base: &Path, v: &v1::StorageVolume, mounted: &[PathBuf], run: &mu
             }
             run.mount("ceph", &v.source, &root, &data).with_context(|| format!("storage {}: mounting {}", v.storage, v.source))?;
         }
+        "smb" if !mounted.contains(&root) => {
+            std::fs::create_dir_all(&root).with_context(|| format!("making {}", root.display()))?;
+            let (host, _) = smb_source(&v.source).context("checked")?;
+            let mut data: Vec<String> = v.options.split(',').filter(|o| !o.is_empty()).map(str::to_string).collect();
+            if !data.iter().any(|o| o.starts_with("ip=") || o.starts_with("addr=")) {
+                data.push(format!("ip={}", smb_ip(host).with_context(|| format!("storage {}", v.storage))?));
+            }
+            if !v.secret.is_empty() {
+                // The kernel splits its options at commas: one in the password is written twice.
+                data.push(format!("password={}", v.secret.replace(',', ",,")));
+            }
+            run.mount("cifs", &v.source, &root, &data.join(",")).with_context(|| format!("storage {}: mounting {}", v.storage, v.source))?;
+        }
         "path" if !root.is_dir() => bail!("storage {}: {} is not on this node", v.storage, root.display()),
         _ => {}
     }
@@ -155,13 +202,18 @@ pub fn bind(volumes: &[String], dirs: &BTreeMap<String, PathBuf>) -> Vec<String>
         .collect()
 }
 
-/// Takes the node's writes to shared storage away (plan 7.1, after its workloads stopped): every NFS and CephFS mount under
-/// `base` is unmounted, forced and lazily, so a process still holding a file there loses it. A path storage is the
-/// host's to take away. Gives back how many it unmounted.
+/// Takes the node's writes to shared storage away (plan 7.1, after its workloads stopped): every NFS, SMB and CephFS
+/// mount under `base` is made read-only, then unmounted, forced and lazily. Read-only first, where the filesystem lets
+/// it (it refuses while a file is open for writing): a lazy unmount only hides the tree, and a process that still holds
+/// a file there could otherwise go on writing through it. A path storage is the host's to take away. Gives back how
+/// many it unmounted.
 pub fn unmount_all(base: &Path, mounted: &[PathBuf], run: &mut impl Run) -> usize {
     let mut n = 0;
     for m in mounted.iter().filter(|m| m.starts_with(base) && m.as_path() != base) {
         let at = m.to_string_lossy();
+        if let Err(e) = run.run("mount", &["-o", "remount,bind,ro", &at]) {
+            tracing::warn!("fence: making {at} read-only: {e:#}");
+        }
         match run.run("umount", &["-f", "-l", &at]) {
             Ok(_) => n += 1,
             Err(e) => tracing::error!("fence: unmounting {at}: {e:#}"),
@@ -211,7 +263,7 @@ pub fn probe(name: &str, driver: &str, root: &Path, node_id: &str, mounted: &[Pa
     let started = std::time::Instant::now();
     let mut h = v1::StorageHealth { name: name.into(), driver: driver.into(), at_ms: unix_ms(), ..Default::default() };
     let r: Result<()> = (|| {
-        if matches!(driver, "nfs" | "cephfs") && !mounted.iter().any(|m| m == root) {
+        if matches!(driver, "nfs" | "cephfs" | "smb") && !mounted.iter().any(|m| m == root) {
             bail!("{} is not mounted at {}", name, root.display());
         }
         if !root.is_dir() {
@@ -281,11 +333,11 @@ impl Health {
         self.save(&k);
     }
 
-    /// The storage the node mounts (nfs, cephfs) forgotten, as fencing unmounted it: it is not this node's to answer
+    /// The storage the node mounts (nfs, smb, cephfs) forgotten, as fencing unmounted it: it is not this node's to answer
     /// for until a workload needs it again (and mounts it), so the managers do not take it for failing here.
     pub fn forget_mounted(&self) {
         let mut k = self.lock();
-        k.retain(|_, x| !matches!(x.driver.as_str(), "nfs" | "cephfs"));
+        k.retain(|_, x| !matches!(x.driver.as_str(), "nfs" | "cephfs" | "smb"));
         self.save(&k);
     }
 
@@ -371,8 +423,8 @@ mod tests {
         }
 
         fn mount(&mut self, fstype: &str, source: &str, target: &Path, data: &str) -> Result<()> {
-            let (shown, secret) = match data.split_once(",secret=") {
-                Some((o, k)) => (format!("{o},secret=<key>"), Some(k.to_string())),
+            let (shown, secret) = match data.split_once(",secret=").map(|(o, k)| (o, k, "secret")).or_else(|| data.split_once(",password=").map(|(o, k)| (o, k, "password"))) {
+                Some((o, k, word)) => (format!("{o},{word}=<key>"), Some(k.to_string())),
                 None => (data.to_string(), None),
             };
             self.calls.push(format!("mount({fstype}) {source} {} {shown}", target.display()));
@@ -390,6 +442,55 @@ mod tests {
 
     fn cephfs() -> v1::StorageVolume {
         v1::StorageVolume { storage: "ceph".into(), driver: "cephfs".into(), source: "192.0.2.1,192.0.2.2:6789,[2001:db8::3]:/".into(), options: "name=fd,fs=fs1".into(), secret: "AQBkZXZpY2Uta2V5LW9mLXRlc3Q=".into(), ..nfs() }
+    }
+
+    fn smb() -> v1::StorageVolume {
+        v1::StorageVolume { storage: "share".into(), driver: "smb".into(), source: "//192.0.2.60/fd/apps".into(), options: "username=fd,vers=3.0".into(), secret: "pa,ss word".into(), ..nfs() }
+    }
+
+    #[test]
+    fn an_smb_share_is_mounted_by_the_kernel_with_its_password_handed_over_and_never_on_a_command_line() {
+        let base = tempfile::tempdir().unwrap();
+        let mut f = Fake::default();
+        let dir = prepare(base.path(), &smb(), &[], &mut &mut f).unwrap();
+        let root = base.path().join("share");
+        assert_eq!(dir, root.join("app/pg"));
+        assert_eq!(f.calls, vec![format!("mount(cifs) //192.0.2.60/fd/apps {} username=fd,vers=3.0,ip=192.0.2.60,password=<key>", root.display())], "the kernel resolves no names: the address goes with it");
+        assert_eq!(f.secrets, vec!["pa,,ss word"], "a comma in the password doubled, as the kernel reads it");
+        let mut f = Fake::default();
+        prepare(base.path(), &smb(), std::slice::from_ref(&root), &mut &mut f).unwrap();
+        assert!(f.calls.is_empty(), "mounted already: {:?}", f.calls);
+        let guest = v1::StorageVolume { options: "guest,vers=3.0".into(), secret: String::new(), ..smb() };
+        let mut f = Fake::default();
+        prepare(base.path(), &guest, &[], &mut &mut f).unwrap();
+        assert_eq!(f.calls, vec![format!("mount(cifs) //192.0.2.60/fd/apps {} guest,vers=3.0,ip=192.0.2.60", root.display())]);
+    }
+
+    #[test]
+    fn an_smb_share_is_named_plainly_and_takes_no_password_in_its_options() {
+        let base = tempfile::tempdir().unwrap();
+        let mut f = Fake::default();
+        for bad in [
+            v1::StorageVolume { source: "192.0.2.60:/fd".into(), ..smb() },
+            v1::StorageVolume { source: "//192.0.2.60".into(), ..smb() },
+            v1::StorageVolume { source: "//192.0.2.60/fd/../etc".into(), ..smb() },
+            v1::StorageVolume { source: "///fd".into(), ..smb() },
+            v1::StorageVolume { options: "username=fd,password=x".into(), ..smb() },
+            v1::StorageVolume { options: "username=fd,pass=x".into(), ..smb() },
+            v1::StorageVolume { options: "credentials=/etc/x".into(), ..smb() },
+            v1::StorageVolume { options: "username=fd vers=3".into(), ..smb() },
+            v1::StorageVolume { secret: "nul\0here".into(), ..smb() },
+        ] {
+            assert!(prepare(base.path(), &bad, &[], &mut &mut f).is_err(), "{bad:?}");
+        }
+        assert!(f.calls.is_empty(), "nothing run: {:?}", f.calls);
+        assert!(root_of(base.path(), &v1::StorageVolume { source: "//nas.example/fd$".into(), ..smb() }).is_ok(), "a name, and a hidden share");
+    }
+
+    #[test]
+    fn an_smb_share_not_mounted_is_unhealthy() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!probe("share", "smb", d.path(), "n1", &[]).ok);
     }
 
     #[test]
@@ -495,7 +596,19 @@ mod tests {
         assert_eq!(m[2], PathBuf::from("/var/lib/freightdock-worker/storage/my nas"));
         let mut f = Fake::default();
         assert_eq!(unmount_all(Path::new("/var/lib/freightdock-worker/storage"), &m, &mut &mut f), 2);
-        assert_eq!(f.calls, vec!["umount -f -l /var/lib/freightdock-worker/storage/nas", "umount -f -l /var/lib/freightdock-worker/storage/my nas"]);
+        assert_eq!(
+            f.calls,
+            vec![
+                "mount -o remount,bind,ro /var/lib/freightdock-worker/storage/nas",
+                "umount -f -l /var/lib/freightdock-worker/storage/nas",
+                "mount -o remount,bind,ro /var/lib/freightdock-worker/storage/my nas",
+                "umount -f -l /var/lib/freightdock-worker/storage/my nas",
+            ],
+            "read-only first: a file still open there can write no more, even through the lazily unmounted tree"
+        );
+        let mut f = Fake { fail: true, ..Default::default() };
+        assert_eq!(unmount_all(Path::new("/var/lib/freightdock-worker/storage"), &m[1..2], &mut &mut f), 0);
+        assert_eq!(f.calls.len(), 2, "a refused remount does not keep the unmount from being tried");
     }
 
     #[test]
