@@ -36,6 +36,11 @@ pub struct Executor {
     storage: std::sync::OnceLock<PathBuf>,
     /// How the shared storage made ready here answers (G11.8), for the heartbeat.
     health: std::sync::OnceLock<Arc<crate::storage::Health>>,
+    /// The channel to the manager of the stream now: where an Upgrade's binary is fetched from.
+    channel: Mutex<Option<tonic::transport::Channel>>,
+    /// Where an upgrade puts the new binary and whether it restarts after: the running binary and, under systemd,
+    /// yes, unless set (a test sets a file of its own, never its own binary).
+    upgrade_target: Mutex<Option<(PathBuf, bool)>>,
 }
 
 /// A command's last update, as kept on disk.
@@ -70,7 +75,7 @@ impl Executor {
             tracing::warn!(command = %id, "was running when the worker stopped; reported failed");
             *k = Kept { status: CommandStatus::Failed as i32, message: "the worker restarted while running it".into(), result_json: String::new(), at_ms: now_ms() };
         }
-        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default(), net: Default::default(), storage: Default::default(), health: Default::default() };
+        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default(), net: Default::default(), storage: Default::default(), health: Default::default(), channel: Mutex::default(), upgrade_target: Mutex::default() };
         e.save(&e.known.lock().expect("known lock"));
         Arc::new(e)
     }
@@ -108,6 +113,16 @@ impl Executor {
     /// The stream updates go to from now on; `None` when there is none.
     pub fn attach(&self, tx: Option<mpsc::Sender<WorkerMessage>>) {
         *self.out.lock().expect("out lock") = tx;
+    }
+
+    /// The channel to the manager of the stream now; `None` when there is none.
+    pub fn attach_channel(&self, ch: Option<tonic::transport::Channel>) {
+        *self.channel.lock().expect("channel lock") = ch;
+    }
+
+    /// Upgrades write `path` and restart after or not, in place of the running binary and systemd's say.
+    pub fn upgrade_to(&self, path: PathBuf, restart: bool) {
+        *self.upgrade_target.lock().expect("upgrade target lock") = Some((path, restart));
     }
 
     /// Commands seen and not finished.
@@ -192,6 +207,28 @@ impl Executor {
                 ("running".into(), v)
             }
             Op::StopContainer(s) => ("stopped".into(), crate::docker::stop(docker()?, &s).await?),
+            Op::Upgrade(u) => {
+                let ch = self.channel.lock().expect("channel lock").clone().ok_or_else(|| anyhow::anyhow!("not connected to a manager"))?;
+                let bytes = crate::upgrade::fetch(ch, &u.sha256, u.size).await?;
+                let set = self.upgrade_target.lock().expect("upgrade target lock").clone();
+                let (exe, restart) = match set {
+                    Some(t) => t,
+                    None => (crate::upgrade::running_exe()?, crate::upgrade::under_systemd()),
+                };
+                let at = exe.display().to_string();
+                tokio::task::spawn_blocking(move || crate::upgrade::replace(&exe, &bytes)).await??;
+                if restart {
+                    tracing::warn!("{at} replaced with {}; restarting on it", u.version);
+                    // After the result is sent: systemd (Restart=always) starts it again, on the new binary.
+                    tokio::spawn(async {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        std::process::exit(0);
+                    });
+                    (format!("{at} replaced; restarting on {}", u.version), serde_json::json!({ "restarting": true }))
+                } else {
+                    (format!("{at} replaced; restart the worker to run {}", u.version), serde_json::json!({ "restarting": false }))
+                }
+            }
             Op::CephCommand(c) => ("ran ceph".into(), crate::ceph::run(docker()?, &c).await?),
             Op::Cephadm(c) => {
                 // cephadm lives beside the worker's other files (the storage directory's parent).

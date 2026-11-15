@@ -56,5 +56,6 @@ pub fn capabilities(docker_version: Option<String>, host_shell: bool) -> Capabil
         docker_requests: true,
         shells: true,
         host_shell,
+        upgrade: true,
     }
 }

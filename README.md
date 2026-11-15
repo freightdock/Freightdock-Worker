@@ -41,6 +41,11 @@ deploy/          systemd unit
 | `FREIGHTDOCK_WORKER_HOST_SHELL` | `on` | `off`: no shell on this host from the UI (a container's is still offered); the managers cannot turn it back on |
 | `RUST_LOG` | `freightdock_worker=info,warn` | How much it logs |
 
+`freightdock-worker --version` and `--help` answer; any other argument is refused (exit 2), never taken as leave to
+start a second worker as this node. An upgrade from the managers (the Upgrade command) fetches the release's binary
+from the manager over the session, checks its size and SHA-256, writes it beside the running binary and renames it
+over, then, under systemd only, exits so that systemd starts it again on the new one; its containers keep running.
+
 While Contracts and Manager are not published, this crate takes them by path (`../Freightdock-Contracts`, and `../Freightdock-Manager` for
 the end-to-end test), so it builds only with those checkouts beside it.
 

@@ -132,6 +132,7 @@ impl Worker {
         let paced = Arc::new(std::sync::atomic::AtomicU64::new(every.as_millis() as u64));
         tracing::info!(manager = %welcome.manager_id, cluster = %welcome.cluster_id, "connected to {addr}; heartbeat every {}ms", every.as_millis());
         self.exec.attach(Some(tx.clone()));
+        self.exec.attach_channel(Some(ch.clone()));
         if welcome.renew_certificate {
             // Its certificate expires within a year: a new one now, used from the next stream on.
             let (files, ch) = (Files::in_dir(&self.config.data_dir), ch.clone());
@@ -240,6 +241,7 @@ impl Worker {
             }
         };
         self.exec.attach(None);
+        self.exec.attach_channel(None);
         beats.abort();
         end
     }

@@ -19,6 +19,7 @@ pub mod session;
 pub mod shell;
 pub mod storage;
 pub mod tls;
+pub mod upgrade;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -116,6 +116,45 @@ async fn a_worker_enrols_connects_and_runs_a_command() {
         other => panic!("{other:?}"),
     }
 
+    // An upgrade: the release's binary is in the manager's folder, the worker fetches it over its own session, checks
+    // it and puts it in place (here a file of the test's, never its own binary, and no restart).
+    assert!(m.store.read(|s| s.nodes[&node_id].report.as_ref().unwrap().upgrade), "the worker says it takes upgrades");
+    let bin = wdir.path().join("bin").join("freightdock-worker");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, b"old").unwrap();
+    w.exec.upgrade_to(bin.clone(), false);
+    let new: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let sum = freightdock_manager::release::put_blob(mdir.path(), &new).unwrap();
+    let release = |size| freightdock_manager::release::Release { version: "9.0.0".into(), arch: "amd64".into(), worker: Some(freightdock_manager::release::Binary { sha256: sum.clone(), size }), manager: None, source: "upload".into(), at: now_ms() };
+    m.store.propose(Entry::ReleaseSet { release: release(new.len() as u64) }).await.unwrap();
+    let upgrade = |id: &str, sha256: &str, size: u64| CommandRecord { id: id.into(), node_id: node_id.clone(), op: Op::Upgrade { version: "9.0.0".into(), sha256: sha256.into(), size }, config_version: 0, created_at: now_ms(), deadline: now_ms() + 60_000, status: CommandStatus::Pending, message: String::new(), result_json: String::new(), updated_at: now_ms() };
+    let ended = |id: &'static str| {
+        let m = m.clone();
+        move || m.store.read(|s| s.commands.get(id).filter(|c| matches!(c.status, CommandStatus::Succeeded | CommandStatus::Failed)).map(|c| (c.status, c.message.clone())))
+    };
+    let c = upgrade("u1", &sum, new.len() as u64);
+    m.store.propose(Entry::CommandCreated { command: c.clone() }).await.unwrap();
+    m.deliver(&c);
+    let (st, msg) = until("the upgrade's end", ended("u1")).await;
+    assert_eq!(st, CommandStatus::Succeeded, "{msg}");
+    assert_eq!(std::fs::read(&bin).unwrap(), new, "the new binary in place, whole");
+    assert!(msg.contains("restart the worker"), "{msg}");
+    // A release that says another size: the worker takes no more than it says, and keeps what it has.
+    std::fs::write(&bin, b"old").unwrap();
+    m.store.propose(Entry::ReleaseSet { release: release(1000) }).await.unwrap();
+    let c = upgrade("u2", &sum, 1000);
+    m.store.propose(Entry::CommandCreated { command: c.clone() }).await.unwrap();
+    m.deliver(&c);
+    let (st, msg) = until("the short upgrade's end", ended("u2")).await;
+    assert_eq!((st, std::fs::read(&bin).unwrap()), (CommandStatus::Failed, b"old".to_vec()), "{msg}");
+    // A checksum that is no release's: the manager hands nothing out.
+    let c = upgrade("u3", &"0".repeat(64), 3);
+    m.store.propose(Entry::CommandCreated { command: c.clone() }).await.unwrap();
+    m.deliver(&c);
+    let (st, msg) = until("the unknown upgrade's end", ended("u3")).await;
+    assert_eq!(st, CommandStatus::Failed);
+    assert!(msg.contains("no binary of the cluster's release"), "{msg}");
+
     // G2.7: a new certificate, asked with the current one; the worker comes back with it, and the old one still opens.
     let before = m.store.read(|s| s.nodes[&node_id].cert_sha256.clone());
     let ch = freightdock_worker::tls::channel(&format!("127.0.0.1:{port}"), freightdock_worker::tls::mutual(&w.files).unwrap()).await.unwrap();
