@@ -10,6 +10,22 @@ use freightdock_worker::{Config, Files, enrol};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    use freightdock_worker::cli::{Cli, USAGE, parse};
+    match parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Cli::Run => {}
+        Cli::Version => {
+            println!("freightdock-worker {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Cli::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Cli::Unknown(a) => {
+            eprintln!("freightdock-worker: {a:?} is not an argument it takes\n{USAGE}");
+            std::process::exit(2)
+        }
+    }
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "freightdock_worker=info,warn".into())).init();
     let config = Config::from(|k| std::env::var(k).ok())?;
     std::fs::create_dir_all(&config.data_dir).with_context(|| format!("making {}", config.data_dir.display()))?;

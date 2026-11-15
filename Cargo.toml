@@ -1,7 +1,7 @@
 [package]
 name = "freightdock-worker"
 description = "Freightdock's worker-agent: joins a cluster's managers and runs the workloads they place on this host."
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/freightdock/Worker"

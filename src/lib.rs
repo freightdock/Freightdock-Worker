@@ -7,6 +7,7 @@
 
 pub mod ceph;
 pub mod cephadm;
+pub mod cli;
 pub mod docker;
 pub mod enrol;
 pub mod exec;
