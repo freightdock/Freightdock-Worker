@@ -146,9 +146,12 @@ pub fn mount_points(mountinfo: &str) -> Vec<PathBuf> {
 /// (path), and the volume's directory made on it.
 pub fn prepare(base: &Path, v: &v1::StorageVolume, mounted: &[PathBuf], run: &mut impl Run) -> Result<PathBuf> {
     let root = root_of(base, v)?;
-    let ok_dir = v.dir.split_once('/').is_some_and(|(stack, vol)| !stack.is_empty() && !vol.is_empty() && plain(stack, "-") && plain(vol, "._-") && !vol.starts_with('.'));
+    // `<stack>/<volume>`, or the folder the Compose file names: 1 to 8 parts, none empty or starting with a dot, so
+    // never `..` and never out of the storage.
+    let parts: Vec<&str> = v.dir.split('/').collect();
+    let ok_dir = parts.len() <= 8 && parts.iter().all(|p| !p.is_empty() && !p.starts_with('.') && plain(p, "._-"));
     if !ok_dir {
-        bail!("{:?} is not a volume's directory (stack/volume)", v.dir);
+        bail!("{:?} is not a volume's folder on the storage", v.dir);
     }
     match v.driver.as_str() {
         "nfs" if !mounted.contains(&root) => {
@@ -564,13 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_folder_named_in_the_compose_file_is_made_where_it_says() {
+        let shared = tempfile::tempdir().unwrap();
+        let mut f = Fake::default();
+        for dir in ["ntfy", "apps/ntfy/data", "a/b/c/d/e/f/g/h"] {
+            let v = v1::StorageVolume { driver: "path".into(), source: shared.path().to_string_lossy().into_owned(), options: String::new(), dir: dir.into(), ..nfs() };
+            assert_eq!(prepare(Path::new("/unused"), &v, &[], &mut &mut f).unwrap(), shared.path().join(dir));
+            assert!(shared.path().join(dir).is_dir());
+        }
+    }
+
+    #[test]
     fn nothing_from_the_managers_climbs_out_of_the_storage_or_reads_as_another_option() {
         let base = tempfile::tempdir().unwrap();
         let mut f = Fake::default();
         for bad in [
             v1::StorageVolume { dir: "../etc".into(), ..nfs() },
             v1::StorageVolume { dir: "app/..".into(), ..nfs() },
-            v1::StorageVolume { dir: "app".into(), ..nfs() },
+            v1::StorageVolume { dir: "".into(), ..nfs() },
+            v1::StorageVolume { dir: "/etc".into(), ..nfs() },
+            v1::StorageVolume { dir: "a//b".into(), ..nfs() },
+            v1::StorageVolume { dir: "a/b/".into(), ..nfs() },
+            v1::StorageVolume { dir: "a/.git".into(), ..nfs() },
+            v1::StorageVolume { dir: "a/b c".into(), ..nfs() },
+            v1::StorageVolume { dir: "1/2/3/4/5/6/7/8/9".into(), ..nfs() },
             v1::StorageVolume { storage: "../x".into(), ..nfs() },
             v1::StorageVolume { source: "192.0.2.50:/export/../etc".into(), ..nfs() },
             v1::StorageVolume { options: "vers=4,x y".into(), ..nfs() },
