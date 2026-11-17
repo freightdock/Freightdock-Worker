@@ -41,6 +41,8 @@ pub struct Executor {
     /// Where an upgrade puts the new binary and whether it restarts after: the running binary and, under systemd,
     /// yes, unless set (a test sets a file of its own, never its own binary).
     upgrade_target: Mutex<Option<(PathBuf, bool)>>,
+    /// What the disk and the shared storage folders hold, by stack, measured in the background (the Storage page).
+    usage: Arc<crate::usage::Usage>,
 }
 
 /// A command's last update, as kept on disk.
@@ -75,7 +77,7 @@ impl Executor {
             tracing::warn!(command = %id, "was running when the worker stopped; reported failed");
             *k = Kept { status: CommandStatus::Failed as i32, message: "the worker restarted while running it".into(), result_json: String::new(), at_ms: now_ms() };
         }
-        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default(), net: Default::default(), storage: Default::default(), health: Default::default(), channel: Mutex::default(), upgrade_target: Mutex::default() };
+        let e = Executor { node_id, docker, known: Mutex::new(known), out: Mutex::default(), journal, fence: Default::default(), net: Default::default(), storage: Default::default(), health: Default::default(), channel: Mutex::default(), upgrade_target: Mutex::default(), usage: Default::default() };
         e.save(&e.known.lock().expect("known lock"));
         Arc::new(e)
     }
@@ -108,6 +110,10 @@ impl Executor {
     /// The shared storage's health, probed now and then, if this worker keeps any.
     pub fn storage_health(&self) -> Option<Arc<crate::storage::Health>> {
         self.health.get().cloned()
+    }
+
+    pub fn usage(&self) -> Arc<crate::usage::Usage> {
+        self.usage.clone()
     }
 
     /// The stream updates go to from now on; `None` when there is none.

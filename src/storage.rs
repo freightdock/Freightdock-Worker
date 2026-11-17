@@ -326,6 +326,11 @@ impl Health {
         self.known.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Each storage made ready here and where it is on the node.
+    pub fn roots(&self) -> Vec<(String, PathBuf)> {
+        self.lock().iter().map(|(n, x)| (n.clone(), x.root.clone())).collect()
+    }
+
     /// A storage made ready here, to probe from now on.
     pub fn remember(&self, name: &str, driver: &str, root: &Path) {
         let mut k = self.lock();
